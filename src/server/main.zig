@@ -26,23 +26,31 @@ pub fn main() !void {
         0x1e, 0x2c, 0x9,  0x8d, 0x4b, 0x4d, 0xc1, 0x40,
     };
 
+    const allocator = std.heap.page_allocator;
+
     const keypair = try Crypto.generateKeypair();
 
     std.debug.print("Generated new keypair.\nPub: {x:0>2}\nPriv: {x:0>2} \n", .{ keypair.public_key, keypair.secret_key });
 
-    var bob = doubleratchet.init("bob", sk, keypair);
+    var bob = doubleratchet.init(allocator, "bob", sk, keypair);
 
-    var alice = try doubleratchet.initRemoteKey("alice", sk, keypair.public_key);
+    var alice = try doubleratchet.initRemoteKey(allocator, "alice", sk, keypair.public_key);
 
-    const msg = try alice.RatchetEncrypt("Hi bob!");
+    const og = try alice.RatchetEncrypt("Hi bob!");
+    for (0..100) |_| {
+        _ = try alice.RatchetEncrypt("doing work..");
+    }
 
+    const msg = try alice.RatchetEncrypt("uhm wat");
     const result = try bob.RatchetDecrypt(msg);
+    const ogresult = try bob.RatchetDecrypt(og);
 
     std.debug.print("Shared key: {x:0>2}\n\n", .{sk});
     std.debug.print("Bob pub: {x:0>2}\n", .{bob.state.DHr});
     std.debug.print("Alice pub: {x:0>2}\n\n", .{alice.state.DHr});
     std.debug.print("Message alice: {x:0>2}\n", .{msg.ciphertext});
     std.debug.print("Message bob: {s}\n\n", .{result});
+    std.debug.print("Message bob og: {s}\n\n", .{ogresult});
 
     // const bobSaying = [_][]const u8{ "Hey Alice", "How are you doing", "Good to hear" };
     // const aliceSaying = [_][]const u8{ "Hey Bob", "I'm good!", "Anytime" };

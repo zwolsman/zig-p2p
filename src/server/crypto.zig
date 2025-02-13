@@ -58,7 +58,7 @@ pub fn encrypt(mk: [32]u8, in: []const u8, ad: []const u8) ![]u8 {
 }
 
 fn computeSignature(key: Key, cipherText: []const u8, associatedData: []const u8) [crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 {
-    var out: [crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 = undefined;
+    var out: [32]u8 = undefined;
     var h = crypto.auth.hmac.sha2.HmacSha256.init(&key);
     h.update(associatedData);
     h.update(cipherText);

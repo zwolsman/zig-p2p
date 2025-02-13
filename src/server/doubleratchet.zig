@@ -2,25 +2,26 @@ const std = @import("std");
 const Crypto = @import("crypto.zig");
 const KeyPair = Crypto.KeyPair;
 
-pub fn init(id: []const u8, sharedKey: [32]u8, keyPair: KeyPair) Session {
-    return Session.init(id, sharedKey, keyPair);
+pub fn init(allocator: std.mem.Allocator, id: []const u8, sharedKey: [32]u8, keyPair: KeyPair) Session {
+    return Session.init(allocator, id, sharedKey, keyPair);
 }
 
-pub fn initRemoteKey(id: []const u8, sharedKey: [32]u8, remoteKey: [32]u8) !Session {
-    return Session.initRemoteKey(id, sharedKey, remoteKey);
+pub fn initRemoteKey(allocator: std.mem.Allocator, id: []const u8, sharedKey: [32]u8, remoteKey: [32]u8) !Session {
+    return Session.initRemoteKey(allocator, id, sharedKey, remoteKey);
 }
 
 const Session = struct {
     id: []const u8,
     state: State,
+    allocator: std.mem.Allocator,
 
-    fn init(id: []const u8, sharedKey: [32]u8, keyPair: KeyPair) Session {
-        return Session{ .id = id, .state = State.init(sharedKey, keyPair) };
+    fn init(allocator: std.mem.Allocator, id: []const u8, sharedKey: [32]u8, keyPair: KeyPair) Session {
+        return Session{ .allocator = allocator, .id = id, .state = State.init(allocator, sharedKey, keyPair) };
     }
 
-    fn initRemoteKey(id: []const u8, sharedKey: [32]u8, remoteKey: [32]u8) !Session {
+    fn initRemoteKey(allocator: std.mem.Allocator, id: []const u8, sharedKey: [32]u8, remoteKey: [32]u8) !Session {
         const keyPair = try Crypto.generateKeypair();
-        var session = Session{ .id = id, .state = State.init(sharedKey, keyPair) };
+        var session = Session{ .allocator = allocator, .id = id, .state = State.init(allocator, sharedKey, keyPair) };
 
         session.state.DHr = remoteKey;
 
@@ -44,27 +45,39 @@ const Session = struct {
     }
 
     pub fn RatchetDecrypt(self: *Session, message: Message) ![]u8 {
-        var sc = self.state;
-        // TODO: save skipped keys
-        // skip keys if they are not equal
-        if (!std.mem.eql(u8, message.header.DH[0..], sc.DHr[0..])) {
-            sc.skipMessageKeys(sc.DHr, message.header.PN) catch {
-                unreachable; // TODO; invalid skipping
-            };
+        var header = message.header;
 
-            sc.dhRatchet(message.header) catch {
-                unreachable; // TODO: can't perform ratchet step
-            };
+        // if it is skipped.. just decrypt it
+        if (self.state.mkSkipped.get(message.header.DH, message.header.N)) |mk| {
+            return try Crypto.decrypt(mk, message.ciphertext, &header.encode());
         }
-        sc.skipMessageKeys(sc.DHr, message.header.N) catch {
-            unreachable; // TODO; invalid skipping
-        };
+
+        var sc = self.state;
+        var skippedKeys = std.ArrayList(skippedKey).init(self.allocator);
+
+        if (!std.mem.eql(u8, message.header.DH[0..], sc.DHr[0..])) {
+            try skippedKeys.appendSlice(try sc.skipMessageKeys(sc.DHr, message.header.PN));
+
+            try sc.dhRatchet(message.header);
+        }
+        try skippedKeys.appendSlice(try sc.skipMessageKeys(sc.DHr, message.header.N));
+
         const mk = sc.receiveChain.step();
 
-        var header = message.header;
-        const plaintext = Crypto.decrypt(mk, message.ciphertext, &header.encode());
+        const plaintext = try Crypto.decrypt(mk, message.ciphertext, &header.encode());
+
+        try skippedKeys.append(skippedKey{
+            .key = sc.DHr,
+            .nr = message.header.N,
+            .mk = mk,
+            .seq = sc.keysCount,
+        });
 
         sc.keysCount += 1;
+
+        for (skippedKeys.items) |skipped| {
+            try sc.mkSkipped.put(self.id, skipped.key, skipped.nr, skipped.mk, skipped.seq);
+        }
 
         self.state = sc;
         return plaintext;
@@ -115,7 +128,7 @@ const MessageHeader = struct {
 
 const KeyStorage = struct {
     const Self = @This();
-    const entry = struct { messageKey: Crypto.Key, seqNum: u32, sessionID: []const u8 };
+    const entry = struct { sessionID: []const u8, messageKey: Crypto.Key, seqNum: u32 };
     allocator: std.mem.Allocator,
     storage: std.AutoHashMap(Crypto.Key, std.AutoHashMap(u32, entry)),
 
@@ -128,6 +141,27 @@ const KeyStorage = struct {
         const e = msgs.get(msgNum) orelse return null;
         return e.messageKey;
     }
+
+    fn put(self: *Self, sessionId: []const u8, pubKey: Crypto.Key, msgNum: u32, mk: Crypto.Key, seqNum: u32) !void {
+        const v = try self.storage.getOrPut(pubKey);
+
+        if (!v.found_existing) {
+            v.value_ptr.* = std.AutoHashMap(u32, entry).init(self.allocator);
+        }
+
+        try v.value_ptr.put(msgNum, entry{
+            .sessionID = sessionId,
+            .messageKey = mk,
+            .seqNum = seqNum,
+        });
+    }
+};
+
+const skippedKey = struct {
+    key: [32]u8,
+    nr: u32,
+    mk: [32]u8,
+    seq: u32,
 };
 
 const State = struct {
@@ -147,6 +181,10 @@ const State = struct {
     // Number of messages in previous sending chain.
     pn: u32,
 
+    // Dictionary of skipped-over message keys, indexed by ratchet public key or header key
+    // and message number.
+    mkSkipped: KeyStorage,
+
     // The maximum number of message keys that can be skipped in a single chain.
     // WithMaxSkip should be set high enough to tolerate routine lost or delayed messages,
     // but low enough that a malicious sender can't trigger excessive recipient computation.
@@ -164,7 +202,7 @@ const State = struct {
     // KeysCount the number of keys generated for decrypting
     keysCount: u32,
 
-    fn init(sharedKey: [32]u8, keyPair: KeyPair) State {
+    fn init(allocator: std.mem.Allocator, sharedKey: [32]u8, keyPair: KeyPair) State {
         return State{
             .DHs = keyPair,
             .DHr = sharedKey,
@@ -174,6 +212,7 @@ const State = struct {
             .receiveChain = Chain{ .CK = sharedKey, .n = 0 },
 
             .pn = 0,
+            .mkSkipped = KeyStorage.init(allocator),
             .maxSkip = 1000,
             .maxKeep = 2000,
             .maxMessageKeysPerSession = 2000,
@@ -182,15 +221,7 @@ const State = struct {
         };
     }
 
-    const skippedKey = struct {
-        key: [32]u8,
-        nr: u32,
-        mK: [32]u8,
-        seq: u32,
-    };
-
-    fn skipMessageKeys(self: *State, key: [32]u8, until: u32) !void {
-        _ = key; // autofix
+    fn skipMessageKeys(self: *State, key: Crypto.Key, until: u32) ![]skippedKey {
         if (until < self.receiveChain.n) {
             // out of order message
             unreachable;
@@ -200,11 +231,18 @@ const State = struct {
             unreachable;
         }
 
+        // TODO: allocator
+
+        var skippedKeys = try std.heap.page_allocator.alloc(skippedKey, until - self.receiveChain.n);
+
         while (self.receiveChain.n < until) {
             const mk = self.receiveChain.step();
-            std.debug.print("skipped key {any}\n", .{mk});
+
+            skippedKeys[until - self.receiveChain.n] = skippedKey{ .key = key, .nr = self.receiveChain.n - 1, .mk = mk, .seq = self.keysCount };
             self.keysCount += 1;
         }
+
+        return skippedKeys;
     }
 
     fn dhRatchet(self: *State, m: MessageHeader) !void {
