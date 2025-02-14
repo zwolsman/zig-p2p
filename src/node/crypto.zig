@@ -39,17 +39,13 @@ pub fn deriveEncKeys(mk: [32]u8) struct { encKey: [32]u8, authKey: [32]u8, iv: [
 
 pub fn encrypt(mk: [32]u8, in: []const u8, ad: []const u8) ![]u8 {
     const keys = deriveEncKeys(mk);
-    var buffer = try allocator.alloc(u8, in.len + ad.len);
 
-    @memcpy(buffer[0..in.len], in);
-    @memcpy(buffer[in.len..], ad);
-
-    const out = try allocator.alloc(u8, buffer.len + keys.iv.len + 32);
+    const out = try allocator.alloc(u8, in.len + keys.iv.len + 32);
 
     @memcpy(out[0..16], &keys.iv);
 
     const ctx = crypto.core.aes.Aes256.initEnc(keys.encKey);
-    crypto.core.modes.ctr(crypto.core.aes.AesEncryptCtx(crypto.core.aes.Aes256), ctx, out[16 .. 16 + buffer.len], buffer, keys.iv, std.builtin.Endian.big);
+    crypto.core.modes.ctr(crypto.core.aes.AesEncryptCtx(crypto.core.aes.Aes256), ctx, out[16 .. 16 + in.len], in, keys.iv, std.builtin.Endian.big);
 
     const sig = computeSignature(keys.authKey, out[0 .. out.len - 32], ad);
 
