@@ -3,6 +3,7 @@ const net = std.net;
 const posix = std.posix;
 const system = std.posix.system;
 const Allocator = std.mem.Allocator;
+const proto = @import("protocol.zig");
 
 const log = std.log.scoped(.tcp_demo);
 const addr = std.net.Address.parseIp("0.0.0.0", 5882) catch unreachable;
@@ -305,15 +306,20 @@ const Client = struct {
             return error.PendingMessage;
         }
 
-        if (msg.len + 4 > self.write_buf.len) {
+        const message = try proto.echo(alloc, msg); // TODO: fix alloc
+
+        const header = proto.MessageHeader.forMessage(message);
+
+        std.debug.print("Sent header: {any}\npayload: {x:0>2}\n", .{ header, message });
+
+        const end = message.len + proto.MessageHeader.size;
+        if (end > self.write_buf.len) {
             // Could allocate a dynamic buffer. Could use a large buffer pool.
             return error.MessageTooLarge;
         }
 
-        // copy our length prefix + message to our buffer
-        std.mem.writeInt(u32, self.write_buf[0..4], @intCast(msg.len), .little);
-        const end = msg.len + 4;
-        @memcpy(self.write_buf[4..end], msg);
+        @memcpy(self.write_buf[0..proto.MessageHeader.size], &header.encode());
+        @memcpy(self.write_buf[proto.MessageHeader.size..end], message);
 
         // setup our to_write slice
         self.to_write = self.write_buf[0..end];
@@ -385,15 +391,24 @@ const Reader = struct {
         std.debug.assert(pos >= start);
         const unprocessed = buf[start..pos];
 
-        if (unprocessed.len < 4) {
-            self.ensureSpace(4 - unprocessed.len) catch unreachable;
+        if (unprocessed.len < proto.MessageHeader.size) {
+            self.ensureSpace(proto.MessageHeader.size - unprocessed.len) catch unreachable;
             return null;
         }
 
-        const message_len = std.mem.readInt(u32, unprocessed[0..4], .little);
+        const h = try readHeader(unprocessed);
+        const header_size = switch (h) {
+            .base => proto.MessageHeader.size,
+            .enc => unreachable,
+        };
 
-        // the length of our message + the length of our prefix
-        const total_len = message_len + 4;
+        const message_len = switch (h) {
+            .base => |b| b.length,
+            .enc => |e| e.length,
+        };
+
+        // the length of our message + the length of our header
+        const total_len = message_len + header_size;
 
         if (unprocessed.len < total_len) {
             try self.ensureSpace(total_len);
@@ -401,7 +416,17 @@ const Reader = struct {
         }
 
         self.start += total_len;
-        return unprocessed[4..total_len];
+        const raw = unprocessed[header_size..total_len];
+
+        std.debug.print("Header: {any}\nPayload: {x:0>2}\n", .{ h.base, raw });
+
+        switch (h) {
+            .base => return raw,
+            .enc => |e| {
+                std.debug.print("Having to decrypt: {any}\nRaw: {x:0>2}\n", .{ e, raw });
+                return raw;
+            },
+        }
     }
 
     fn ensureSpace(self: *Reader, space: usize) error{BufferTooSmall}!void {
@@ -420,6 +445,15 @@ const Reader = struct {
         std.mem.copyForwards(u8, buf[0..unprocessed.len], unprocessed);
         self.start = 0;
         self.pos = unprocessed.len;
+    }
+
+    fn readHeader(data: []u8) !union(enum) { base: proto.MessageHeader, enc: proto.EncMessageHeader } {
+        var h = try proto.MessageHeader.decode(data);
+
+        if (!h.isEncrypted())
+            return .{ .base = h };
+
+        return .{ .enc = proto.EncMessageHeader.decode(h, data[proto.MessageHeader.size..]) };
     }
 };
 
