@@ -79,7 +79,7 @@ const Session = struct {
             try sc.mkSkipped.put(self.id, skipped.key, skipped.nr, skipped.mk, skipped.seq);
         }
 
-        self.state = sc;
+        self.state = sc; // TODO: trim keys
         return plaintext;
     }
 
