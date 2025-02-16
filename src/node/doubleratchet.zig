@@ -10,7 +10,7 @@ pub fn initRemoteKey(allocator: std.mem.Allocator, id: []const u8, sharedKey: [3
     return Session.initRemoteKey(allocator, id, sharedKey, remoteKey);
 }
 
-const Session = struct {
+pub const Session = struct {
     id: []const u8,
     state: State,
     allocator: std.mem.Allocator,

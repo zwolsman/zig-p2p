@@ -5,10 +5,11 @@ const Key = crypto.Key;
 const Crc32 = std.hash.crc.Crc32;
 
 const MessageType = enum(u8) {
-    Hello = 0x01,
-    Ping = 0x02,
-    Pong = 0x03,
-    Echo = 0x04,
+    serverKey = 0x01,
+    clientKey = 0x02,
+    Ping = 0x03,
+    Pong = 0x04,
+    Echo = 0x05,
 };
 
 pub const MessageFlags = enum(u8) {
@@ -48,7 +49,7 @@ pub const MessageHeader = struct {
         return Self{ .length = length, .crc = crc, .flags = flags };
     }
 
-    pub fn forMessage(data: []u8) Self {
+    pub fn forMessage(data: []const u8) Self {
         return Self{ .length = @intCast(data.len), .crc = Crc32.hash(data), .flags = 0x0 };
     }
 
@@ -83,7 +84,7 @@ pub const EncMessageHeader = struct {
     n: u32,
     pn: u32,
 
-    const size = MessageHeader.size + Key.len + 4 + 4;
+    pub const size = MessageHeader.size + 32 + 4 + 4;
 
     const Self = @This();
 
@@ -102,65 +103,114 @@ pub const EncMessageHeader = struct {
         return Self{ .length = length, .crc = crc, .flags = flags, .dh = dh, .n = n, .pn = pn };
     }
 
-    fn encode(self: Self) [size]u8 {
+    pub fn encode(self: Self) [size]u8 {
         const base = MessageHeader.init(self.length, self.crc, self.flags).encode();
-        const buffer = [Key.len + 4 + 4]u8;
+        var buffer: [32 + 4 + 4]u8 = undefined;
 
-        @memcpy(buffer[0..Key.len], self.dh);
-        std.mem.writeInt(u32, buffer[Key.len .. Key.len + 4], self.n, .little);
-        std.mem.writeInt(u32, buffer[Key.len + 4 ..], self.pn, .little);
+        @memcpy(buffer[0..32], &self.dh);
+        std.mem.writeInt(u32, buffer[32 .. 32 + 4], self.n, .little);
+        std.mem.writeInt(u32, buffer[32 + 4 ..], self.pn, .little);
 
         return base ++ buffer;
     }
 
     pub fn decode(h: MessageHeader, buff: []u8) Self {
-        _ = h; // autofix
-        _ = buff; // autofix
-        unreachable;
+        return Self{
+            .length = h.length,
+            .crc = h.crc,
+            .flags = h.flags,
+            .dh = buff[0..32].*,
+            .n = std.mem.readInt(u32, buff[32 .. 32 + 4], .little),
+            .pn = std.mem.readInt(u32, buff[36..40], .little),
+        };
+    }
+
+    pub fn forMessage(data: []const u8, dh: Key, n: u32, pn: u32) Self {
+        const base = MessageHeader.forMessage(data);
+
+        return Self{
+            .length = base.length,
+            .crc = base.crc,
+            .flags = @intFromEnum(MessageFlags.encrypted),
+            .dh = dh,
+            .n = n,
+            .pn = pn,
+        };
     }
 };
 
-const Message = union(MessageType) {
-    Hello: Key,
+pub const Message = union(MessageType) {
+    serverKey: Key,
+    clientKey: Key,
     Ping: void,
     Pong: void,
     Echo: []const u8,
 
     const Self = @This();
 
-    fn encode(self: Self, allocator: Allocator) ![]u8 {
+    pub fn encode(self: Self, allocator: Allocator) ![]u8 {
         var payload = std.ArrayList(u8).init(allocator);
         defer payload.deinit();
 
         _ = try payload.append(@intCast(@intFromEnum(self)));
 
         switch (self) {
-            .Hello => |key| {
+            .serverKey, .clientKey => |key| {
                 _ = try payload.writer().writeAll(&key);
             },
             .Ping, .Pong => {},
             .Echo => |msg| {
                 _ = try payload.writer().writeInt(u32, @intCast(msg.len), .little);
-                _ = try payload.writer().writeAll(msg);
+                _ = try payload.writer().write(msg);
             },
         }
 
         return payload.toOwnedSlice();
     }
 
-    fn decode() !Message {
-        unreachable;
+    pub fn parse(buff: []u8) Message {
+        const t: MessageType = @enumFromInt(buff[0]);
+        const payload = buff[1..];
+
+        switch (t) {
+            .serverKey => return Message{ .serverKey = payload[0..32].* },
+            .clientKey => return Message{ .clientKey = payload[0..32].* },
+            .Ping => return Message{ .Ping = {} },
+            .Pong => return Message{ .Pong = {} },
+            .Echo => {
+                const len = std.mem.readInt(u32, payload[0..4], .little);
+                return Message{ .Echo = payload[4 .. 4 + len] };
+            },
+        }
     }
 };
 
-pub fn hello(allocator: Allocator, pubKey: Key) ![]u8 {
-    var msg = Message{ .Hello = pubKey };
+pub fn serverKey(allocator: Allocator, pubKey: Key) ![]u8 {
+    var msg = Message{ .serverKey = pubKey };
+
+    return msg.encode(allocator);
+}
+
+pub fn clientKey(allocator: Allocator, pubKey: Key) ![]u8 {
+    var msg = Message{ .clientKey = pubKey };
 
     return msg.encode(allocator);
 }
 
 pub fn echo(allocator: Allocator, txt: []const u8) ![]u8 {
     var msg = Message{ .Echo = txt };
+
+    return msg.encode(allocator);
+}
+
+pub fn ping(allocator: Allocator) ![]u8 {
+    var msg = Message{ .Ping = {} };
+
+    return msg.encode(allocator);
+}
+
+pub fn pong(allocator: Allocator) ![]u8 {
+    var msg = Message{ .Pong = {} };
 
     return msg.encode(allocator);
 }
