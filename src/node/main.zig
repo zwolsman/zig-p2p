@@ -7,26 +7,38 @@ const proto = @import("protocol.zig");
 const Crypto = @import("crypto.zig");
 const enc = @import("doubleratchet.zig");
 
-const log = std.log.scoped(.tcp_demo);
-const addr = std.net.Address.parseIp("0.0.0.0", 5882) catch unreachable;
+const flags = @import("flags");
+const CliFlags = @import("cliflags.zig");
+
+const log = std.log;
 var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 const alloc = gpa.allocator();
 
 pub fn main() !void {
+    // for Windows compatibility: feed an allocator for args parsing
+    var args = try std.process.argsWithAllocator(alloc);
+    defer args.deinit();
+
+    const cliflags = flags.parseOrExit(&args, "node", CliFlags, .{});
+
+    const listen_addr = try net.Address.parseIp(cliflags.addr, cliflags.port);
+
     var server = Server.init(alloc, 4096) catch {
         log.err("Could not initialise server", .{});
         return;
     };
 
-    var serverThread = try std.Thread.spawn(.{}, runServer, .{&server});
-    serverThread.detach();
+    const s = try server.start(listen_addr);
+    s.detach();
 
-    var client = try BlockingClient.init(alloc);
+    //TODO: server.join();
+
+    var client = try BlockingClient.init(alloc, listen_addr);
 
     log.debug("Created blocking client\npriv: {x:0>2}\npub: {x:0>2}\n\n", .{ client.kp.secret_key, client.kp.public_key });
 
-    try client.connect(addr);
-    log.info("Connected to server: {}", .{addr});
+    try client.connect(listen_addr);
+    log.info("Connected to server: {}", .{listen_addr});
 
     try client.run();
 }
@@ -42,9 +54,9 @@ const BlockingClient = struct {
     encryption: bool,
     session: enc.Session = undefined,
 
-    fn init(allocator: Allocator) !Self {
+    fn init(allocator: Allocator, address: net.Address) !Self {
         const protocol = posix.IPPROTO.TCP;
-        const socket = try posix.socket(addr.any.family, posix.SOCK.STREAM, protocol);
+        const socket = try posix.socket(address.in.sa.family, posix.SOCK.STREAM, protocol);
         try posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
         return Self{
             .socket = socket,
@@ -127,7 +139,7 @@ const BlockingClient = struct {
     }
 };
 
-fn runServer(server: *Server) void {
+fn runServer(server: *Server, addr: net.Address) void {
     defer server.deinit();
 
     std.debug.print("Listening on {}\n", .{addr});
@@ -186,6 +198,10 @@ const Server = struct {
         self.loop.deinit();
         self.client_pool.deinit();
         self.client_node_pool.deinit();
+    }
+
+    fn start(self: *Server, address: std.net.Address) !std.Thread {
+        return std.Thread.spawn(.{}, run, .{ self, address });
     }
 
     fn run(self: *Server, address: std.net.Address) !void {
