@@ -5,13 +5,22 @@ const mem = std.mem;
 const posix = std.posix;
 const os = std.os;
 const system = std.posix.system;
+const fmt = std.fmt;
+
+const kademlia = @import("kademlia.zig");
 
 const Allocator = std.mem.Allocator;
 const X25519 = crypto.dh.X25519;
 
-const ID = struct {
+pub const ID = struct {
     public_key: [32]u8,
     address: net.Address,
+
+    pub fn format(self: ID, comptime layout: []const u8, options: fmt.FormatOptions, writer: anytype) !void {
+        _ = layout;
+        _ = options;
+        try fmt.format(writer, "{}[{}]", .{ self.address, fmt.fmtSliceHexLower(&self.public_key) });
+    }
 };
 
 pub const Node = struct {
@@ -27,15 +36,8 @@ pub const Node = struct {
     loop: KQueue,
     allocator: Allocator,
 
-    clients: std.HashMapUnmanaged(net.Address, *Client, struct {
-        pub fn hash(_: @This(), address: net.Address) u64 {
-            return hashIpAddress(address);
-        }
-
-        pub fn eql(_: @This(), a: net.Address, b: net.Address) bool {
-            return a.eql(b);
-        }
-    }, std.hash_map.default_max_load_percentage),
+    clients: std.HashMapUnmanaged(net.Address, *Client, AddressContext, std.hash_map.default_max_load_percentage),
+    routing_table: kademlia.RoutingTable,
 
     pub fn init(allocator: mem.Allocator, keys: X25519.KeyPair, address: net.Address) !Node {
         return .{
@@ -43,7 +45,7 @@ pub const Node = struct {
             .id = .{ .public_key = keys.public_key, .address = address },
 
             .clients = .{},
-            // self.table = .{ .public_key = keys.public_key };
+            .routing_table = .{ .public_key = keys.public_key },
             .allocator = allocator,
 
             .client_pool = std.heap.MemoryPool(Client).init(allocator),
@@ -112,8 +114,13 @@ pub const Node = struct {
         switch (packet.op) {
             .request => {
                 switch (packet.tag) {
-                    .hello => |pub_key| {
-                        log.debug("Hello {s}", .{std.fmt.fmtSliceHexLower(&pub_key)});
+                    .hello => |peer_pub_key| {
+                        const peer_id: ID = .{ .public_key = peer_pub_key, .address = client.address };
+                        switch (self.routing_table.put(peer_id)) {
+                            .full => log.info("incoming handshake with {} (peer ignored)", .{peer_id}),
+                            .updated => log.info("incoming handshake with {} (peer updated)", .{peer_id}),
+                            .inserted => log.info("incoming handshake with {} (peer registered)", .{peer_id}),
+                        }
 
                         const response = Packet{ .header = .{
                             .len = 32,
@@ -122,15 +129,20 @@ pub const Node = struct {
                             .hello = self.id.public_key,
                         } };
 
-                        try client.writer.write(response);
+                        try client.write(response);
                     },
                     else => return error.UnexpectedTag,
                 }
             },
             .response => {
                 switch (packet.tag) {
-                    .hello => |pub_key| {
-                        log.debug("Hello {s}", .{std.fmt.fmtSliceHexLower(&pub_key)});
+                    .hello => |peer_pub_key| {
+                        const peer_id: ID = .{ .public_key = peer_pub_key, .address = client.address };
+                        switch (self.routing_table.put(peer_id)) {
+                            .full => log.info("handshaked with {} (peer ignored)", .{peer_id}),
+                            .updated => log.info("handshaked with {} (peer updated)", .{peer_id}),
+                            .inserted => log.info("handshaked with {} (peer registered)", .{peer_id}),
+                        }
                     },
                     else => return error.UnexpectedTag,
                 }
@@ -200,7 +212,6 @@ pub const Node = struct {
 
             const client = try self.createClient(socket, address);
 
-            const writer = client.writer;
             const p = Packet{
                 .header = .{
                     .len = 32,
@@ -213,7 +224,7 @@ pub const Node = struct {
                 },
             };
 
-            try writer.write(p);
+            try client.write(p);
             result.value_ptr.* = client;
         }
 
@@ -229,7 +240,7 @@ const Client = struct {
     socket: posix.socket_t,
 
     reader: PacketReader,
-    writer: *PacketWriter,
+    writer: PacketWriter,
 
     server_id: ID,
 
@@ -237,14 +248,14 @@ const Client = struct {
         _ = allocator; // autofix
 
         const stream = net.Stream{ .handle = socket };
-        var writer = PacketWriter.init(stream.writer());
+
         return .{
             .loop = loop,
             .address = address,
             .socket = socket,
 
             .reader = PacketReader.init(stream.reader()),
-            .writer = &writer,
+            .writer = PacketWriter.init(stream.writer()),
 
             .server_id = server_id,
         };
@@ -260,6 +271,10 @@ const Client = struct {
 
         log.debug("Received: {any}", .{packet});
         return packet;
+    }
+
+    fn write(self: *Client, p: Packet) !void {
+        return self.writer.write(p);
     }
 
     fn deinit(self: *Client, allocator: Allocator) void {
@@ -315,55 +330,32 @@ const PacketReader = struct {
 };
 
 const PacketWriter = struct {
-    stream: net.Stream.Writer,
-    buf: [Packet.max_size]u8 = undefined,
-    end: usize = 0,
+    buffer: BufferedWriter,
 
-    const log = std.log.scoped(.packet_writer);
     const Self = @This();
+    const BufferedWriter = std.io.BufferedWriter(Packet.max_size, net.Stream.Writer);
 
-    const Writer = std.io.GenericWriter(*PacketWriter, net.Stream.WriteError, PacketWriter._write);
-
-    pub fn init(w: net.Stream.Writer) Self {
+    pub fn init(stream: net.Stream.Writer) Self {
         return .{
-            .stream = w,
+            .buffer = BufferedWriter{ .unbuffered_writer = stream },
         };
     }
 
     pub fn write(self: *Self, p: Packet) !void {
-        const w: Writer = .{ .context = self };
+        const writer = self.buffer.writer();
 
-        try w.writeInt(u32, p.header.len, .little);
-        try w.writeInt(u8, p.header.flags, .little);
-        try w.writeInt(u8, @intFromEnum(p.op), .little);
-        try w.writeInt(u8, @intFromEnum(p.tag), .little);
+        try writer.writeInt(u32, p.header.len, .little);
+        try writer.writeInt(u8, p.header.flags, .little);
+        try writer.writeInt(u8, @intFromEnum(p.op), .little);
+        try writer.writeInt(u8, @intFromEnum(p.tag), .little);
         switch (p.tag) {
             .ping => {},
-            .hello => |pub_key| {
-                _ = try w.write(&pub_key);
+            .hello => |data| {
+                _ = try writer.write(&data);
             },
         }
 
-        try self.flush();
-    }
-
-    fn flush(self: *Self) net.Stream.WriteError!void {
-        try self.stream.writeAll(self.buf[0..self.end]);
-        self.end = 0;
-    }
-
-    fn _write(self: *Self, bytes: []const u8) net.Stream.WriteError!usize {
-        log.debug("Writing bytes: {x}", .{bytes});
-        if (self.end + bytes.len > self.buf.len) {
-            try self.flush();
-            if (bytes.len > self.buf.len)
-                return self.stream.write(bytes);
-        }
-
-        const new_end = self.end + bytes.len;
-        @memcpy(self.buf[self.end..new_end], bytes);
-        self.end = new_end;
-        return bytes.len;
+        try self.buffer.flush();
     }
 };
 
@@ -398,7 +390,21 @@ pub const Packet = struct {
     tag: Tag2,
 };
 
-pub fn hashIpAddress(address: net.Address) u64 {
+pub const AddressContext = struct {
+    const log = std.log.scoped(.address_context);
+    pub fn hash(_: @This(), address: net.Address) u64 {
+        return hashIpAddress(address);
+    }
+
+    pub fn eql(_: @This(), a: net.Address, b: net.Address) bool {
+        if (a.any.family != b.any.family)
+            return false;
+
+        return a.eql(b);
+    }
+};
+
+fn hashIpAddress(address: net.Address) u64 {
     var hasher = std.hash.Wyhash.init(0);
     switch (address.any.family) {
         posix.AF.INET => {
