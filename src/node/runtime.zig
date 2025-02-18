@@ -16,10 +16,48 @@ pub const ID = struct {
     public_key: [32]u8,
     address: net.Address,
 
+    // pub key + type + ip + port
+    fn size(self: ID) u32 {
+        return @sizeOf([32]u8) + @sizeOf(u8) + @as(u32, switch (self.address.any.family) {
+            posix.AF.INET => @sizeOf([4]u8),
+            posix.AF.INET6 => @sizeOf([16]u8) + @sizeOf(u32),
+            else => unreachable,
+        }) + @sizeOf(u16);
+    }
+
     pub fn format(self: ID, comptime layout: []const u8, options: fmt.FormatOptions, writer: anytype) !void {
         _ = layout;
         _ = options;
         try fmt.format(writer, "{}[{}]", .{ self.address, fmt.fmtSliceHexLower(&self.public_key) });
+    }
+
+    fn write(self: ID, writer: Client.PacketWriterx) !void {
+        try writer.writeAll(&self.public_key);
+        try writer.writeByte(@intCast(self.address.any.family));
+        switch (self.address.any.family) {
+            posix.AF.INET => {
+                try writer.writeInt(u32, self.address.in.sa.addr, .little);
+                try writer.writeInt(u16, self.address.in.sa.port, .little);
+            },
+            posix.AF.INET6 => return error.UnsupportedAddress, // TODO
+            else => unreachable,
+        }
+    }
+    fn read(reader: Client.PacketReaderx) !ID {
+        var id: ID = undefined;
+        id.public_key = try reader.readBytesNoEof(32);
+
+        switch (try reader.readByte()) {
+            posix.AF.INET => {
+                const addr = net.Ip4Address{ .sa = .{ .addr = try reader.readInt(u32, .little), .port = try reader.readInt(u16, .little) } };
+
+                id.address = .{ .in = addr };
+            },
+            posix.AF.INET6 => return error.UnsupportedAddress, // TODO
+            else => unreachable,
+        }
+
+        return id;
     }
 };
 
@@ -114,35 +152,82 @@ pub const Node = struct {
         switch (packet.op) {
             .request => {
                 switch (packet.tag) {
-                    .hello => |peer_pub_key| {
-                        const peer_id: ID = .{ .public_key = peer_pub_key, .address = client.address };
+                    .hello => {
+                        const public_key = try client.readerx().readBytesNoEof(32);
+
+                        const peer_id: ID = .{ .public_key = public_key, .address = client.address };
                         switch (self.routing_table.put(peer_id)) {
-                            .full => log.info("incoming handshake with {} (peer ignored)", .{peer_id}),
-                            .updated => log.info("incoming handshake with {} (peer updated)", .{peer_id}),
-                            .inserted => log.info("incoming handshake with {} (peer registered)", .{peer_id}),
+                            .full => log.info("incoming handshake from {} (peer ignored)", .{peer_id}),
+                            .updated => log.info("incoming handshake from {} (peer updated)", .{peer_id}),
+                            .inserted => log.info("incoming handshake from {} (peer registered)", .{peer_id}),
                         }
 
-                        const response = Packet{ .header = .{
-                            .len = 32,
-                            .flags = 0,
-                        }, .op = .response, .tag = .{
-                            .hello = self.id.public_key,
-                        } };
+                        const p = Packet{
+                            .len = self.id.size(),
+                            .flags = 0x0,
+                            .op = .response,
+                            .tag = .hello,
+                        };
 
-                        try client.write(response);
+                        try p.write(client.writer());
+                        try self.id.write(client.writer());
+
+                        try client.writer_stream.flush();
+                    },
+                    .find_nodes => {
+                        const public_key = try client.readerx().readBytesNoEof(32);
+                        var peer_ids: [16]ID = undefined;
+                        const count = self.routing_table.closestTo(&peer_ids, public_key);
+
+                        var len: u32 = @sizeOf(u8);
+                        for (0..count) |i| {
+                            len += peer_ids[i].size();
+                        }
+
+                        const p = Packet{
+                            .len = len,
+                            .flags = 0,
+                            .op = .response,
+                            .tag = .find_nodes,
+                        };
+                        var writer = client.writer();
+
+                        try p.write(writer);
+
+                        try writer.writeByte(@intCast(count));
+
+                        for (0..count) |i| {
+                            try peer_ids[i].write(writer);
+                        }
+
+                        try writer.context.flush();
                     },
                     else => return error.UnexpectedTag,
                 }
             },
             .response => {
                 switch (packet.tag) {
-                    .hello => |peer_pub_key| {
-                        const peer_id: ID = .{ .public_key = peer_pub_key, .address = client.address };
+                    .hello => {
+                        const peer_id = try ID.read(client.readerx());
+
                         switch (self.routing_table.put(peer_id)) {
-                            .full => log.info("handshaked with {} (peer ignored)", .{peer_id}),
-                            .updated => log.info("handshaked with {} (peer updated)", .{peer_id}),
-                            .inserted => log.info("handshaked with {} (peer registered)", .{peer_id}),
+                            .full => log.info("handshake with {} (peer ignored)", .{peer_id}),
+                            .updated => log.info("handshake with {} (peer updated)", .{peer_id}),
+                            .inserted => log.info("handshake with {} (peer registered)", .{peer_id}),
                         }
+
+                        // var reader = client.readerx();
+                        // const count = try reader.readByte();
+                        // for (0..count) |_| {
+                        //     const peer_id = try ID.read(reader);
+
+                        //     switch (self.routing_table.put(peer_id)) {
+                        //         .full => log.info("handshake with {} (peer ignored)", .{peer_id}),
+                        //         .updated => log.info("handshake with {} (peer updated)", .{peer_id}),
+                        //         .inserted => log.info("handshake with {} (peer registered)", .{peer_id}),
+                        //     }
+                        // }
+
                     },
                     else => return error.UnexpectedTag,
                 }
@@ -213,18 +298,17 @@ pub const Node = struct {
             const client = try self.createClient(socket, address);
 
             const p = Packet{
-                .header = .{
-                    .len = 32,
-                    .flags = 0,
-                },
-
+                .len = 32,
+                .flags = 0,
                 .op = .request,
-                .tag = .{
-                    .hello = self.id.public_key,
-                },
+                .tag = .hello,
             };
 
-            try client.write(p);
+            try p.write(client.writer());
+            try self.id.write(client.writer());
+
+            try client.writer_stream.flush();
+
             result.value_ptr.* = client;
         }
 
@@ -234,13 +318,18 @@ pub const Node = struct {
 
 const Client = struct {
     const log = std.log.scoped(.client);
+    const BufferedWriter = std.io.BufferedWriter(Packet.max_size, net.Stream.Writer);
+    const BufferedReader = std.io.BufferedReader(4096, net.Stream.Reader);
+    const PacketWriterx = BufferedWriter.Writer;
+    const PacketReaderx = BufferedReader.Reader;
 
     loop: *KQueue,
     address: net.Address,
     socket: posix.socket_t,
 
     reader: PacketReader,
-    writer: PacketWriter,
+    writer_stream: BufferedWriter,
+    reader_stream: BufferedReader,
 
     server_id: ID,
 
@@ -255,8 +344,8 @@ const Client = struct {
             .socket = socket,
 
             .reader = PacketReader.init(stream.reader()),
-            .writer = PacketWriter.init(stream.writer()),
-
+            .writer_stream = BufferedWriter{ .unbuffered_writer = stream.writer() },
+            .reader_stream = BufferedReader{ .unbuffered_reader = stream.reader() },
             .server_id = server_id,
         };
     }
@@ -273,8 +362,11 @@ const Client = struct {
         return packet;
     }
 
-    fn write(self: *Client, p: Packet) !void {
-        return self.writer.write(p);
+    fn writer(self: *Client) PacketWriterx {
+        return .{ .context = &self.writer_stream };
+    }
+    fn readerx(self: *Client) PacketReaderx {
+        return .{ .context = &self.reader_stream };
     }
 
     fn deinit(self: *Client, allocator: Allocator) void {
@@ -285,6 +377,8 @@ const Client = struct {
 
 const PacketReader = struct {
     reader: net.Stream.Reader,
+
+    // TODO: buffered?
     fn init(reader: net.Stream.Reader) PacketReader {
         return .{
             .reader = reader,
@@ -292,39 +386,21 @@ const PacketReader = struct {
     }
 
     fn readPacket(self: PacketReader) !Packet {
-        const header = try self.readHeader();
+        const len = try self.reader.readInt(u32, .little);
 
-        if (header.len > Packet.max_size) {
+        if (len > Packet.max_size) {
             return error.PacketTooBig;
         }
+        const flags = try self.reader.readInt(u8, .little);
 
         const op = try self.reader.readEnum(Packet.Op, .little);
         const tag = try self.reader.readEnum(Packet.Tag, .little);
 
-        return .{
-            .header = header,
-            .op = op,
-            .tag = try self.readBody(tag),
-        };
-    }
-
-    fn readBody(self: PacketReader, tag: Packet.Tag) !Packet.Tag2 {
-        return switch (tag) {
-            .ping => .{ .ping = {} },
-            .hello => {
-                const pub_key = try self.reader.readBoundedBytes(32);
-                return .{ .hello = pub_key.buffer };
-            },
-        };
-    }
-
-    fn readHeader(self: PacketReader) !Packet.Header {
-        const len = try self.reader.readInt(u32, .little);
-        const flags = try self.reader.readInt(u8, .little);
-
-        return .{
+        return Packet{
             .len = len,
             .flags = flags,
+            .op = op,
+            .tag = tag,
         };
     }
 };
@@ -344,31 +420,17 @@ const PacketWriter = struct {
     pub fn write(self: *Self, p: Packet) !void {
         const writer = self.buffer.writer();
 
-        try writer.writeInt(u32, p.header.len, .little);
-        try writer.writeInt(u8, p.header.flags, .little);
+        try writer.writeInt(u32, p.len, .little);
+        try writer.writeInt(u8, p.flags, .little);
         try writer.writeInt(u8, @intFromEnum(p.op), .little);
         try writer.writeInt(u8, @intFromEnum(p.tag), .little);
-        switch (p.tag) {
-            .ping => {},
-            .hello => |data| {
-                _ = try writer.write(&data);
-            },
-        }
 
         try self.buffer.flush();
     }
 };
 
 pub const Packet = struct {
-    const log = std.log.scoped(.packet);
     const max_size = 1024;
-
-    pub const Header = struct {
-        len: u32,
-        flags: u8,
-
-        const size = @sizeOf(u32) + @sizeOf(u8);
-    };
 
     const Op = enum(u8) {
         request,
@@ -378,16 +440,20 @@ pub const Packet = struct {
     const Tag = enum(u8) {
         ping,
         hello,
+        find_nodes,
     };
 
-    const Tag2 = union(Tag) { // TODO
-        ping: void,
-        hello: [32]u8,
-    };
-
-    header: Header,
+    len: u32,
+    flags: u8,
     op: Op,
-    tag: Tag2,
+    tag: Tag,
+
+    fn write(p: Packet, writer: Client.PacketWriterx) !void {
+        try writer.writeInt(u32, p.len, .little);
+        try writer.writeInt(u8, p.flags, .little);
+        try writer.writeInt(u8, @intFromEnum(p.op), .little);
+        try writer.writeInt(u8, @intFromEnum(p.tag), .little);
+    }
 };
 
 pub const AddressContext = struct {
