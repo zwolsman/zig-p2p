@@ -109,6 +109,20 @@ pub const RoutingTable = struct {
         return true;
     }
 
+    pub fn get(self: *const RoutingTable, public_key: [32]u8) ?ID {
+        const bucket_index = clz(xor(self.public_key, public_key));
+        const bucket = self.buckets[bucket_index];
+
+        var i: usize = bucket.head;
+        while (i != bucket.tail) : (i -%= 1) {
+            const it = bucket.entries[(i -% 1) & (bucket_size - 1)];
+            if (std.mem.eql(u8, &it.public_key, &public_key))
+                return it;
+        }
+
+        return null;
+    }
+
     pub fn closestTo(self: *const RoutingTable, dst: []ID, public_key: [32]u8) usize {
         var count: usize = 0;
 

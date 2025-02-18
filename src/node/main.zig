@@ -8,6 +8,7 @@ const mem = std.mem;
 
 const flags = @import("flags");
 const CliFlags = @import("cliflags.zig");
+const kademlia = @import("kademlia.zig");
 
 const Allocator = std.mem.Allocator;
 const X25519 = std.crypto.dh.X25519;
@@ -44,9 +45,60 @@ pub fn main() !void {
         log.info("connected to bootstrap node: {}", .{client.address});
     }
 
+    if (options.interactive)
+        openTty(&node);
+
     try node.run();
 }
 
+fn openTty(n: *runtime.Node) void {
+    const run = struct {
+        const log = std.log.scoped(.tty);
+
+        fn run(node: *runtime.Node) void {
+            log.info("Opening interactive tty\n", .{});
+            defer log.info("Closing interactive tty\n", .{});
+
+            const r = std.io.getStdIn().reader();
+            var buf: [1024]u8 = undefined;
+            while (r.readUntilDelimiterOrEof(&buf, '\n') catch return) |txt| {
+                if (std.mem.eql(u8, txt, "info")) {
+                    std.debug.print("total peers connected to: {}", .{node.routing_table.len});
+                }
+                if (txt.len == 64) {
+                    std.debug.print("looking up: {s}\n", .{txt});
+
+                    var public_key: [32]u8 = undefined;
+                    _ = fmt.hexToBytes(&public_key, txt) catch |err| {
+                        log.warn("could convert to public key; {}", .{err});
+                        continue;
+                    };
+
+                    if (std.mem.eql(u8, &node.id.public_key, &public_key)) {
+                        std.debug.print("it's you!\n", .{});
+                        continue;
+                    }
+
+                    if (node.routing_table.get(public_key)) |peer_id| {
+                        std.debug.print("you're connected to it: {}\n", .{peer_id});
+                        continue;
+                    }
+
+                    var peer_ids: [16]runtime.ID = undefined;
+                    const node_count = node.routing_table.closestTo(&peer_ids, public_key);
+                    std.debug.print("closest: {any}\n", .{peer_ids[0..node_count]});
+                }
+            }
+        }
+    }.run;
+
+    const thread = std.Thread.spawn(.{}, run, .{n}) catch {
+        std.debug.print("Could not open interactive tty\n", .{});
+        return;
+    };
+
+    thread.detach();
+}
 fn parseIpAddress(address: []const u8) !net.Address {
     const parsed = splitHostPort(address) catch |err| return switch (err) {
         error.DelimiterNotFound => net.Address.parseIp("127.0.0.1", try fmt.parseUnsigned(u16, address, 10)),
