@@ -65,7 +65,7 @@ fn openTty(n: *runtime.Node) void {
             var buf: [1024]u8 = undefined;
             while (r.readUntilDelimiterOrEof(&buf, '\n') catch return) |txt| {
                 if (std.mem.eql(u8, txt, "info")) {
-                    std.debug.print("total peers connected to: {}", .{node.routing_table.len});
+                    std.debug.print("total peers connected to: {}\n", .{node.routing_table.len});
                 }
                 if (txt.len == 64) {
                     std.debug.print("looking up: {s}\n", .{txt});
@@ -101,6 +101,7 @@ fn openTty(n: *runtime.Node) void {
 
     thread.detach();
 }
+
 fn parseIpAddress(address: []const u8) !net.Address {
     const parsed = splitHostPort(address) catch |err| return switch (err) {
         error.DelimiterNotFound => net.Address.parseIp("127.0.0.1", try fmt.parseUnsigned(u16, address, 10)),
@@ -166,18 +167,46 @@ fn bootstrapNodeWithPeers(node: *runtime.Node) !void {
 
     for (0..count) |i| {
         var client = try node.getOrCreateClient(peer_ids[i].address);
-        const p = runtime.Packet{
+        try posix.setsockopt(client.socket, posix.SOL.SOCKET, posix.SOCK.NONBLOCK, &std.mem.toBytes(@as(c_int, 0)));
+
+        var writer = client.writer_stream.writer();
+        try (runtime.Packet{
             .len = 32,
             .flags = 0x0,
             .op = .request,
             .tag = .find_nodes,
-        };
+        }).write(writer);
 
-        var writer = client.writer_stream.writer();
-        try p.write(writer);
         try writer.writeAll(&node.id.public_key);
         try client.writer_stream.flush();
 
-        // TODO: sync this but yeah.. hard?
+        const response = try runtime.Packet.read(client.reader());
+        switch (response.op) {
+            .response => {
+                switch (response.tag) {
+                    .find_nodes => {
+                        const len = try client.reader().readInt(u8, .little);
+                        log.debug("{?} provided {} peers", .{ client.peer_id, len });
+                        for (0..len) |_| {
+                            const peer_id = runtime.ID.read(client.reader()) catch break;
+                            _ = node.getOrCreateClient(peer_id.address) catch |err| {
+                                log.warn("could not connect to {}, err: {}", .{ peer_id, err });
+                                continue;
+                            };
+                        }
+                    },
+                    else => {
+                        log.warn("unexpected tag {}", .{response.tag});
+                        break;
+                    },
+                }
+            },
+            else => {
+                log.warn("unexpected op {}", .{response.op});
+                break;
+            },
+        }
+
+        try posix.setsockopt(client.socket, posix.SOL.SOCKET, posix.SOCK.NONBLOCK, &std.mem.toBytes(@as(c_int, 1)));
     }
 }
