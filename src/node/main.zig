@@ -45,6 +45,8 @@ pub fn main() !void {
         log.info("connected to bootstrap node: {}", .{client.address});
     }
 
+    try bootstrapNodeWithPeers(&node);
+
     if (options.interactive)
         openTty(&node);
 
@@ -153,4 +155,29 @@ fn splitHostPort(address: []const u8) !HostPort {
     const port = address[i + 1 ..];
 
     return HostPort{ .host = host, .port = port };
+}
+
+fn bootstrapNodeWithPeers(node: *runtime.Node) !void {
+    const log = std.log.scoped(.main);
+    log.debug("boostrapping node..", .{});
+
+    var peer_ids: [16]runtime.ID = undefined;
+    const count = node.routing_table.closestTo(&peer_ids, node.id.public_key);
+
+    for (0..count) |i| {
+        var client = try node.getOrCreateClient(peer_ids[i].address);
+        const p = runtime.Packet{
+            .len = 32,
+            .flags = 0x0,
+            .op = .request,
+            .tag = .find_nodes,
+        };
+
+        var writer = client.writer_stream.writer();
+        try p.write(writer);
+        try writer.writeAll(&node.id.public_key);
+        try client.writer_stream.flush();
+
+        // TODO: sync this but yeah.. hard?
+    }
 }
