@@ -31,7 +31,7 @@ pub const ID = struct {
         try fmt.format(writer, "{}[{}]", .{ self.address, fmt.fmtSliceHexLower(&self.public_key) });
     }
 
-    fn write(self: ID, writer: Client.Writer) !void {
+    fn write(self: ID, writer: ClientWriter.Writer) !void {
         try writer.writeAll(&self.public_key);
         try writer.writeByte(@intCast(self.address.any.family));
         switch (self.address.any.family) {
@@ -141,7 +141,7 @@ pub const Node = struct {
                             system.EVFILT_WRITE => {
                                 // can write to the socket
                                 //TODO:
-                                client.writer_stream.flush() catch |err| {
+                                client.write() catch |err| {
                                     log.err("failed to write: {}", .{err});
                                     self.closeClient(client);
                                     break;
@@ -169,17 +169,16 @@ pub const Node = struct {
                             .inserted => log.info("incoming handshake from {} (peer registered)", .{peer_id}),
                         }
 
-                        const p = Packet{
+                        try (Packet{
                             .len = self.id.size(),
                             .flags = 0x0,
                             .op = .response,
                             .tag = .hello,
-                        };
+                        }).write(client.writer());
 
-                        try p.write(client.writer());
                         try self.id.write(client.writer());
 
-                        try client.writer_stream.flush();
+                        try client.write();
                     },
                     .find_nodes => {
                         const public_key = try client.reader().readBytesNoEof(32);
@@ -204,7 +203,7 @@ pub const Node = struct {
                             try peer_ids[i].write(client.writer());
                         }
 
-                        try client.writer_stream.flush();
+                        try client.write();
                     },
                     else => return error.UnexpectedTag,
                 }
@@ -266,7 +265,7 @@ pub const Node = struct {
 
                         try self.id.write(c.writer());
 
-                        try c.writer_stream.flush();
+                        try c.write();
                     },
                     else => return error.UnexpectedTag,
                 }
@@ -337,23 +336,22 @@ pub const Node = struct {
             const tpe: u32 = posix.SOCK.STREAM;
             const protocol = posix.IPPROTO.TCP;
             const socket = try posix.socket(address.any.family, tpe, protocol);
-            log.debug("connecting to {}", .{address});
+            log.info("connecting to {}", .{address});
             try posix.connect(socket, &address.any, address.getOsSockLen());
 
             const client = try self.createClient(socket, address);
             errdefer client.deinit(self.allocator);
 
-            const p = Packet{
+            try (Packet{
                 .len = 32,
                 .flags = 0,
                 .op = .request,
                 .tag = .hello,
-            };
+            }).write(client.writer());
 
-            try p.write(client.writer());
             try self.id.write(client.writer());
 
-            try client.writer_stream.flush();
+            try client.write();
 
             // wait for hello
             const response = try Packet.read(client.reader());
@@ -387,7 +385,7 @@ pub const Node = struct {
 
 const Client = struct {
     const log = std.log.scoped(.client);
-    const BufferedWriter = std.io.BufferedWriter(Packet.max_size, net.Stream.Writer);
+    const BufferedWriter = std.io.BufferedWriter(Packet.max_len, net.Stream.Writer);
     const BufferedReader = std.io.BufferedReader(4096, net.Stream.Reader);
     const Writer = BufferedWriter.Writer;
     const Reader = BufferedReader.Reader;
@@ -396,8 +394,9 @@ const Client = struct {
     address: net.Address,
     socket: posix.socket_t,
 
-    writer_stream: BufferedWriter,
     reader_stream: BufferedReader,
+
+    client_writer: ClientWriter,
 
     peer_id: ?ID = null,
 
@@ -416,28 +415,84 @@ const Client = struct {
             .address = address,
             .socket = socket,
 
-            .writer_stream = BufferedWriter{ .unbuffered_writer = stream.writer() },
+            // .writer_stream = BufferedWriter{ .unbuffered_writer = stream.writer() },
             .reader_stream = BufferedReader{ .unbuffered_reader = stream.reader() },
+
+            .client_writer = .{ .context = .{ .socket = socket } },
         };
     }
 
-    pub fn writer(self: *Client) Writer {
-        return .{ .context = &self.writer_stream };
+    pub fn writer(self: *Client) ClientWriter.Writer {
+        return self.client_writer.writer();
     }
 
     pub fn reader(self: *Client) Reader {
         return .{ .context = &self.reader_stream };
     }
 
+    pub fn write(self: *Client) !void {
+        log.debug("trying to flush..", .{});
+        try self.client_writer.flush();
+        log.debug("flushed", .{});
+    }
+
     fn deinit(self: *Client, allocator: Allocator) void {
-        _ = allocator; // autofix
-        _ = self; // autofix
+        self.client_writer.deinit(allocator);
+    }
+};
+
+const ClientWriter = struct {
+    const Self = @This();
+    const log = std.log.scoped(.client_writer);
+
+    pub const Error = error{
+        PacketTooBig,
+    };
+
+    pub const Writer = std.io.Writer(*Self, Error, write);
+
+    buffer: [Packet.max_len]u8 = undefined,
+    end: usize = 0,
+    context: struct {
+        socket: posix.socket_t,
+    },
+
+    fn flush(self: *Self) !void {
+        const packet = self.buffer[0..Packet.size];
+        const payload = self.buffer[Packet.size..self.end];
+        log.debug("Packet: {x}, payload: {x}", .{ packet, payload });
+
+        const stream = net.Stream{ .handle = self.context.socket };
+        var out = std.io.bufferedWriter(stream.writer());
+
+        try out.writer().writeAll(packet);
+        try out.writer().writeAll(payload);
+
+        try out.flush();
+        self.end = 0;
+    }
+
+    pub fn writer(self: *Self) Writer {
+        return .{ .context = self };
+    }
+
+    pub fn write(self: *Self, bytes: []const u8) Error!usize {
+        log.debug("writing {x}", .{bytes});
+        if (self.end + bytes.len > self.buffer.len) {
+            return error.PacketTooBig;
+        }
+
+        const new_end = self.end + bytes.len;
+        @memcpy(self.buffer[self.end..new_end], bytes);
+        self.end = new_end;
+        return bytes.len;
     }
 };
 
 pub const Packet = struct {
     const log = std.log.scoped(.packet);
-    const max_size = 1024;
+    const max_len = 1024;
+    const size = @sizeOf(u32) + @sizeOf(u8) + @sizeOf(u8) + @sizeOf(u8);
 
     const Op = enum(u8) {
         request,
@@ -457,8 +512,8 @@ pub const Packet = struct {
     op: Op,
     tag: Tag,
 
-    pub fn write(p: Packet, writer: Client.Writer) !void {
-        if (p.len > Packet.max_size) {
+    pub fn write(p: Packet, writer: anytype) !void {
+        if (p.len > Packet.max_len) {
             return error.PacketTooBig;
         }
 
@@ -470,8 +525,9 @@ pub const Packet = struct {
     }
 
     pub fn read(reader: Client.Reader) !Packet {
+        log.debug("trying to read packet..", .{});
         const len = try reader.readInt(u32, .little);
-        if (len > Packet.max_size) {
+        if (len > Packet.max_len) {
             return error.PacketTooBig;
         }
 

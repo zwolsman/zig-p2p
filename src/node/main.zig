@@ -105,7 +105,7 @@ fn openTty(n: *runtime.Node) void {
                     client.writer().writeAll(&public_key) catch continue;
 
                     client.writer().writeInt(u8, 0, .little) catch continue;
-                    client.writer_stream.flush() catch continue;
+                    client.write() catch continue;
 
                     std.debug.print("sent route cmd to {}\n", .{peer_id});
                 }
@@ -203,7 +203,7 @@ fn splitHostPort(address: []const u8) !HostPort {
 
 fn bootstrapNodeWithPeers(node: *runtime.Node) !void {
     const log = std.log.scoped(.main);
-    log.debug("boostrapping node..", .{});
+    log.info("boostrapping node..", .{});
 
     var peer_ids: [16]runtime.ID = undefined;
     const count = node.routing_table.closestTo(&peer_ids, node.id.public_key);
@@ -212,16 +212,16 @@ fn bootstrapNodeWithPeers(node: *runtime.Node) !void {
         var client = try node.getOrCreateClient(peer_ids[i].address);
         try posix.setsockopt(client.socket, posix.SOL.SOCKET, posix.SOCK.NONBLOCK, &std.mem.toBytes(@as(c_int, 0)));
 
-        var writer = client.writer_stream.writer();
+        log.debug("findings node by quering {?}", .{client.peer_id});
         try (runtime.Packet{
             .len = 32,
             .flags = 0x0,
             .op = .request,
             .tag = .find_nodes,
-        }).write(writer);
+        }).write(client.writer());
 
-        try writer.writeAll(&node.id.public_key);
-        try client.writer_stream.flush();
+        try client.writer().writeAll(&node.id.public_key);
+        try client.write();
 
         const response = try runtime.Packet.read(client.reader());
         switch (response.op) {
