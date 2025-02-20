@@ -81,8 +81,8 @@ pub const Node = struct {
 
     pub fn init(allocator: mem.Allocator, keys: Ed25519.KeyPair, address: net.Address) !Node {
         return .{
-            .keys = keys,
             .id = .{ .public_key = keys.public_key.bytes, .address = address },
+            .keys = keys,
 
             .clients = .{},
             .routing_table = .{ .public_key = keys.public_key.bytes },
@@ -174,7 +174,7 @@ pub const Node = struct {
 
                         const sk = try crypto.dh.X25519.scalarmult(client.keys.secret_key, pk);
 
-                        log.debug("shared secret: {}", .{fmt.fmtSliceHexLower(&sk)});
+                        log.debug("shared secret: {}", .{fmt.fmtSliceHexLower(&sk)}); //TODO: use shared key
 
                         try (Packet{
                             .len = self.id.size(),
@@ -325,7 +325,7 @@ pub const Node = struct {
         const client: *Client = try self.client_pool.create();
         errdefer self.client_pool.destroy(client);
 
-        client.* = Client.init(self.allocator, socket, address, &self.loop) catch |err| {
+        client.* = Client.init(self.allocator, socket, address, &self.loop, &self.keys) catch |err| {
             posix.close(socket);
             log.err("failed to initialize client: {}", .{err});
             return err;
@@ -357,8 +357,9 @@ pub const Node = struct {
                 .tag = .hello,
             }).write(client.writer());
 
-            try self.id.write(client.writer());
-            try client.writer().writeAll(&client.keys.public_key);
+            try self.id.write(client.writer()); // server id
+            try client.writer().writeAll(&client.keys.public_key); // connection key
+
             try client.write();
 
             // wait for hello
@@ -420,6 +421,7 @@ const Client = struct {
         socket: posix.socket_t,
         address: std.net.Address,
         loop: *KQueue,
+        server_kp: *Ed25519.KeyPair,
     ) !Client {
         _ = allocator; // autofix
 
@@ -432,7 +434,10 @@ const Client = struct {
             .keys = keys,
 
             .reader_stream = BufferedReader{ .unbuffered_reader = stream.reader() },
-            .client_writer = .{ .context = .{ .socket = socket } },
+            .client_writer = .{ .context = .{
+                .socket = socket,
+                .server_kp = server_kp,
+            } },
         };
     }
 
@@ -470,18 +475,21 @@ const ClientWriter = struct {
     end: usize = 0,
     context: struct {
         socket: posix.socket_t,
+        server_kp: *Ed25519.KeyPair,
     },
 
     fn flush(self: *Self) !void {
         const packet = self.buffer[0..Packet.size];
         const payload = self.buffer[Packet.size..self.end];
-        log.debug("Packet: {x}, payload: {x}", .{ packet, payload });
 
         const stream = net.Stream{ .handle = self.context.socket };
         var out = std.io.bufferedWriter(stream.writer());
 
         try out.writer().writeAll(packet);
         try out.writer().writeAll(payload);
+
+        const sig = try self.context.server_kp.sign(&out.buf, null); // TODO: add noise
+        log.debug("Packet: {x}, payload: {x}, signature: {}", .{ packet, payload, fmt.fmtSliceHexLower(&sig.toBytes()) });
 
         try out.flush();
         self.end = 0;

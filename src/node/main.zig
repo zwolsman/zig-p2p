@@ -50,6 +50,7 @@ pub fn main() !void {
     if (options.interactive)
         openTty(&node);
 
+    log.info("node is running", .{});
     try node.run();
 }
 
