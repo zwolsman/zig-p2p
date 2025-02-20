@@ -209,8 +209,65 @@ pub const Node = struct {
                     else => return error.UnexpectedTag,
                 }
             },
-            .response => {
+            .response => return error.UnexpectedOp,
+            .command => {
                 switch (packet.tag) {
+                    .route => {
+                        const src = try client.reader().readBytesNoEof(32);
+                        const dst = try client.reader().readBytesNoEof(32);
+                        const count = try client.reader().readInt(u8, .little);
+                        if (count > 16) {
+                            return error.TooManyHops;
+                        }
+
+                        var hops: [16]ID = undefined;
+                        for (0..count) |i| {
+                            hops[i] = try ID.read(client.reader());
+                        }
+
+                        log.debug("{} => {} (hops: {any})", .{ fmt.fmtSliceHexLower(&src), fmt.fmtSliceHexLower(&dst), hops[0..count] });
+                        if (std.mem.eql(u8, &self.id.public_key, &dst)) {
+                            log.debug("ack route from {}", .{fmt.fmtSliceHexLower(&src)});
+                            return;
+                        }
+
+                        const peer_id = pid: {
+                            if (self.routing_table.get(dst)) |peer_id| {
+                                break :pid peer_id;
+                            } else {
+                                var peer_ids: [16]ID = undefined;
+                                const n = self.routing_table.closestTo(&peer_ids, dst);
+                                if (n == 0) {
+                                    log.warn("could not route to {}", .{fmt.fmtSliceHexLower(&dst)});
+                                    return;
+                                }
+                                break :pid peer_ids[0]; // TODO: pick random peer
+                            }
+                        };
+
+                        log.debug("fwd route to {}", .{peer_id});
+
+                        const c = try self.getOrCreateClient(peer_id.address);
+
+                        try (Packet{
+                            .len = packet.len + self.id.size(),
+                            .flags = 0x0,
+                            .op = .command,
+                            .tag = .route,
+                        }).write(c.writer());
+
+                        try c.writer().writeAll(&src);
+                        try c.writer().writeAll(&dst);
+
+                        try c.writer().writeInt(u8, count + 1, .little);
+                        for (0..count) |i| {
+                            try hops[i].write(c.writer());
+                        }
+
+                        try self.id.write(c.writer());
+
+                        try c.writer_stream.flush();
+                    },
                     else => return error.UnexpectedTag,
                 }
             },
@@ -364,7 +421,7 @@ const Client = struct {
         };
     }
 
-    fn writer(self: *Client) Writer {
+    pub fn writer(self: *Client) Writer {
         return .{ .context = &self.writer_stream };
     }
 
@@ -385,12 +442,14 @@ pub const Packet = struct {
     const Op = enum(u8) {
         request,
         response,
+        command,
     };
 
     const Tag = enum(u8) {
         ping,
         hello,
         find_nodes,
+        route,
     };
 
     len: u32,

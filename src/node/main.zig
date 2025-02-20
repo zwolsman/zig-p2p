@@ -67,6 +67,49 @@ fn openTty(n: *runtime.Node) void {
                 if (std.mem.eql(u8, txt, "info")) {
                     std.debug.print("total peers connected to: {}\n", .{node.routing_table.len});
                 }
+
+                if (std.mem.startsWith(u8, txt, "route")) {
+                    var public_key: [32]u8 = undefined;
+                    _ = fmt.hexToBytes(&public_key, txt[6..70]) catch |err| {
+                        log.warn("could convert to public key; {}", .{err});
+                        continue;
+                    };
+
+                    std.debug.print("routing to {}\n", .{fmt.fmtSliceHexLower(&public_key)});
+                    const peer_id = pid: {
+                        if (node.routing_table.get(public_key)) |peer_id| {
+                            break :pid peer_id;
+                        }
+
+                        var peer_ids: [16]runtime.ID = undefined;
+                        const count = node.routing_table.closestTo(&peer_ids, public_key);
+                        if (count == 0) {
+                            log.warn("could not route packet to {}", .{fmt.fmtSliceHexLower(&public_key)});
+                            continue;
+                        }
+                        break :pid peer_ids[0];
+                    };
+
+                    const client = node.getOrCreateClient(peer_id.address) catch |err| {
+                        log.warn("couldn't create client ({}): {}", .{ peer_id, err });
+                        continue;
+                    };
+
+                    (runtime.Packet{
+                        .len = @sizeOf([32]u8) + @sizeOf([32]u8) + @sizeOf(u8),
+                        .flags = 0x0,
+                        .op = .command,
+                        .tag = .route,
+                    }).write(client.writer()) catch continue;
+                    client.writer().writeAll(&node.id.public_key) catch continue;
+                    client.writer().writeAll(&public_key) catch continue;
+
+                    client.writer().writeInt(u8, 0, .little) catch continue;
+                    client.writer_stream.flush() catch continue;
+
+                    std.debug.print("sent route cmd to {}\n", .{peer_id});
+                }
+
                 if (txt.len == 64) {
                     std.debug.print("looking up: {s}\n", .{txt});
 
