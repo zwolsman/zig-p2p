@@ -11,7 +11,7 @@ const CliFlags = @import("cliflags.zig");
 const kademlia = @import("kademlia.zig");
 
 const Allocator = std.mem.Allocator;
-const X25519 = std.crypto.dh.X25519;
+const Ed25519 = std.crypto.sign.Ed25519;
 
 var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 var alloc = gpa.allocator();
@@ -28,13 +28,13 @@ pub fn main() !void {
 
     const options = flags.parseOrExit(&args, "node", CliFlags, .{ .trailing_list = &bootstrap_addresses });
 
-    const keys = try X25519.KeyPair.create(null);
+    const keys = try Ed25519.KeyPair.create(null);
     const listen_address = try parseIpAddress(options.listen_address);
 
     var node: runtime.Node = try runtime.Node.init(alloc, keys, listen_address);
 
-    log.debug("public key: {}", .{fmt.fmtSliceHexLower(&keys.public_key)});
-    log.debug("secret key: {}", .{fmt.fmtSliceHexLower(&keys.secret_key)});
+    log.debug("public key: {}", .{fmt.fmtSliceHexLower(&keys.public_key.bytes)});
+    log.debug("secret key: {}", .{fmt.fmtSliceHexLower(keys.secret_key.bytes[0..32])});
 
     try node.listen(listen_address);
     defer node.deinit();
@@ -252,4 +252,23 @@ fn bootstrapNodeWithPeers(node: *runtime.Node) !void {
 
         try posix.setsockopt(client.socket, posix.SOL.SOCKET, posix.SOCK.NONBLOCK, &std.mem.toBytes(@as(c_int, 1)));
     }
+}
+
+test "use X25519 to generate sk based on X25519 KeyPair" {
+    const bob = try std.crypto.dh.X25519.KeyPair.create(null);
+    const alice = try std.crypto.dh.X25519.KeyPair.create(null);
+    std.log.debug("bob pub: {}", .{fmt.fmtSliceHexLower(&bob.public_key)});
+    std.log.debug("bob priv: {}", .{fmt.fmtSliceHexLower(&bob.secret_key)});
+
+    std.log.debug("alice pub: {}", .{fmt.fmtSliceHexLower(&alice.public_key)});
+    std.log.debug("alice priv: {}", .{fmt.fmtSliceHexLower(&alice.secret_key)});
+
+    const bob_secret = bob.secret_key;
+    const alice_secret = alice.secret_key;
+    const sk_bob = try std.crypto.dh.X25519.scalarmult(bob_secret, alice.public_key);
+    const sk_alice = try std.crypto.dh.X25519.scalarmult(alice_secret, bob.public_key);
+
+    std.log.debug("bob sk: {}", .{fmt.fmtSliceHexLower(&sk_bob)});
+    std.log.debug("alice sk: {}", .{fmt.fmtSliceHexLower(&sk_alice)});
+    try std.testing.expectEqualSlices(u8, &sk_bob, &sk_alice);
 }

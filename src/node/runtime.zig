@@ -11,6 +11,7 @@ const kademlia = @import("kademlia.zig");
 
 const Allocator = std.mem.Allocator;
 const X25519 = crypto.dh.X25519;
+const Ed25519 = crypto.sign.Ed25519;
 
 pub const ID = struct {
     public_key: [32]u8,
@@ -66,7 +67,7 @@ pub const Node = struct {
     const log = std.log.scoped(.node);
 
     id: ID,
-    keys: X25519.KeyPair,
+    keys: Ed25519.KeyPair,
     listener: posix.socket_t = undefined,
     listener_address: net.Address = undefined,
 
@@ -78,13 +79,13 @@ pub const Node = struct {
     clients: std.HashMapUnmanaged(net.Address, *Client, AddressContext, std.hash_map.default_max_load_percentage),
     routing_table: kademlia.RoutingTable,
 
-    pub fn init(allocator: mem.Allocator, keys: X25519.KeyPair, address: net.Address) !Node {
+    pub fn init(allocator: mem.Allocator, keys: Ed25519.KeyPair, address: net.Address) !Node {
         return .{
             .keys = keys,
-            .id = .{ .public_key = keys.public_key, .address = address },
+            .id = .{ .public_key = keys.public_key.bytes, .address = address },
 
             .clients = .{},
-            .routing_table = .{ .public_key = keys.public_key },
+            .routing_table = .{ .public_key = keys.public_key.bytes },
             .allocator = allocator,
 
             .client_pool = std.heap.MemoryPool(Client).init(allocator),
@@ -162,12 +163,18 @@ pub const Node = struct {
                     .hello => {
                         const peer_id = try ID.read(client.reader());
                         client.peer_id = peer_id;
+                        const pk = try client.reader().readBytesNoEof(32);
+                        log.debug("received pk {} from {}", .{ fmt.fmtSliceHexLower(&pk), peer_id });
 
                         switch (self.routing_table.put(peer_id)) {
                             .full => log.info("incoming handshake from {} (peer ignored)", .{peer_id}),
                             .updated => log.info("incoming handshake from {} (peer updated)", .{peer_id}),
                             .inserted => log.info("incoming handshake from {} (peer registered)", .{peer_id}),
                         }
+
+                        const sk = try crypto.dh.X25519.scalarmult(client.keys.secret_key, pk);
+
+                        log.debug("shared secret: {}", .{fmt.fmtSliceHexLower(&sk)});
 
                         try (Packet{
                             .len = self.id.size(),
@@ -177,6 +184,7 @@ pub const Node = struct {
                         }).write(client.writer());
 
                         try self.id.write(client.writer());
+                        try client.writer().writeAll(&client.keys.public_key);
 
                         try client.write();
                     },
@@ -350,7 +358,7 @@ pub const Node = struct {
             }).write(client.writer());
 
             try self.id.write(client.writer());
-
+            try client.writer().writeAll(&client.keys.public_key);
             try client.write();
 
             // wait for hello
@@ -360,6 +368,9 @@ pub const Node = struct {
                     switch (response.tag) {
                         .hello => {
                             const peer_id = try ID.read(client.reader());
+                            const pk = try client.reader().readBytesNoEof(32);
+
+                            log.debug("received pk {} from {}", .{ fmt.fmtSliceHexLower(&pk), peer_id });
 
                             client.peer_id = peer_id;
                             switch (self.routing_table.put(peer_id)) {
@@ -367,6 +378,9 @@ pub const Node = struct {
                                 .updated => log.info("handshaked with {} (peer updated)", .{peer_id}),
                                 .inserted => log.info("handshaked with {} (peer registered)", .{peer_id}),
                             }
+                            const sk = try crypto.dh.X25519.scalarmult(client.keys.secret_key, pk);
+
+                            log.debug("shared secret: {}", .{fmt.fmtSliceHexLower(&sk)});
                         },
                         else => return error.UnexpectedTag,
                     }
@@ -395,8 +409,9 @@ const Client = struct {
     socket: posix.socket_t,
 
     reader_stream: BufferedReader,
-
     client_writer: ClientWriter,
+
+    keys: X25519.KeyPair,
 
     peer_id: ?ID = null,
 
@@ -409,15 +424,14 @@ const Client = struct {
         _ = allocator; // autofix
 
         const stream = net.Stream{ .handle = socket };
-
+        const keys = try X25519.KeyPair.create(null); // generate new KP for each client (used for e2e)
         return .{
             .loop = loop,
             .address = address,
             .socket = socket,
+            .keys = keys,
 
-            // .writer_stream = BufferedWriter{ .unbuffered_writer = stream.writer() },
             .reader_stream = BufferedReader{ .unbuffered_reader = stream.reader() },
-
             .client_writer = .{ .context = .{ .socket = socket } },
         };
     }
@@ -437,7 +451,8 @@ const Client = struct {
     }
 
     fn deinit(self: *Client, allocator: Allocator) void {
-        self.client_writer.deinit(allocator);
+        _ = allocator; // autofix
+        _ = self; // autofix
     }
 };
 
