@@ -163,19 +163,22 @@ pub const Node = struct {
                     .hello => {
                         const peer_id = try ID.read(client.reader());
                         log.debug("received id: {}", .{peer_id});
-                        client.assignPeerID(peer_id);
                         const pk = try client.reader().readBytesNoEof(32);
                         log.debug("received pk {} from {}", .{ fmt.fmtSliceHexLower(&pk), peer_id });
+                        const sk = try crypto.dh.X25519.scalarmult(client.keys.secret_key, pk);
+                        log.debug("shared secret: {}", .{fmt.fmtSliceHexLower(&sk)}); //TODO: use shared key
+
+                        const peer_sig = Ed25519.Signature.fromBytes(try client.reader().readBytesNoEof(Ed25519.Signature.encoded_length));
+                        try peer_sig.verify(client.conn.read_buffer[0 .. client.conn.read_end - Ed25519.Signature.encoded_length], try Ed25519.PublicKey.fromBytes(peer_id.public_key));
+
+                        log.debug("{} signature matches from {}", .{ packet.tag, peer_id });
+                        client.assignPeerID(peer_id);
 
                         switch (self.routing_table.put(peer_id)) {
                             .full => log.info("incoming handshake from {} (peer ignored)", .{peer_id}),
                             .updated => log.info("incoming handshake from {} (peer updated)", .{peer_id}),
                             .inserted => log.info("incoming handshake from {} (peer registered)", .{peer_id}),
                         }
-
-                        const sk = try crypto.dh.X25519.scalarmult(client.keys.secret_key, pk);
-
-                        log.debug("shared secret: {}", .{fmt.fmtSliceHexLower(&sk)}); //TODO: use shared key
 
                         try (Packet{
                             .op = .response,
@@ -185,7 +188,12 @@ pub const Node = struct {
                         try self.id.write(client.writer());
                         try client.writer().writeAll(&client.keys.public_key);
 
+                        const sig = try self.keys.sign(client.conn.write_buffer[0..client.conn.write_end], null);
+                        try client.writer().writeAll(&sig.toBytes());
+
                         try client.write();
+
+                        client.conn.enableFlag(Connection.Flag.signed);
                     },
                     .find_nodes => {
                         const public_key = try client.reader().readBytesNoEof(32);
@@ -287,7 +295,7 @@ pub const Node = struct {
     }
 
     fn closeClient(self: *Node, client: *Client) void {
-        if (client.peer_id) |peer_id| {
+        if (client.conn.peer_id) |peer_id| {
             if (self.routing_table.delete(peer_id.public_key)) {
                 log.debug("closing client {} (peer removed)", .{peer_id});
             } else {
@@ -353,6 +361,9 @@ pub const Node = struct {
             try self.id.write(client.writer()); // server id
             try client.writer().writeAll(&client.keys.public_key); // connection key
 
+            const sig = try self.keys.sign(client.conn.write_buffer[0..client.conn.write_end], null);
+            try client.writer().writeAll(&sig.toBytes());
+
             try client.write();
 
             // wait for hello
@@ -362,19 +373,27 @@ pub const Node = struct {
                     switch (response.tag) {
                         .hello => {
                             const peer_id = try ID.read(client.reader());
+                            client.assignPeerID(peer_id);
                             const pk = try client.reader().readBytesNoEof(32);
 
                             log.debug("received pk {} from {}", .{ fmt.fmtSliceHexLower(&pk), peer_id });
 
-                            client.assignPeerID(peer_id);
+                            // TODO: toggle encryption
+                            const sk = try crypto.dh.X25519.scalarmult(client.keys.secret_key, pk);
+                            log.debug("shared secret: {}", .{fmt.fmtSliceHexLower(&sk)});
+
+                            const sig_bytes = try client.reader().readBytesNoEof(Ed25519.Signature.encoded_length);
+                            const peer_sig = Ed25519.Signature.fromBytes(sig_bytes);
+
+                            try peer_sig.verify(client.conn.read_buffer[0 .. client.conn.read_end - sig_bytes.len], try Ed25519.PublicKey.fromBytes(peer_id.public_key));
+                            log.debug("{} signature matches from {}", .{ response.tag, peer_id });
+
                             switch (self.routing_table.put(peer_id)) {
                                 .full => log.info("handshaked with {} (peer ignored)", .{peer_id}),
                                 .updated => log.info("handshaked with {} (peer updated)", .{peer_id}),
                                 .inserted => log.info("handshaked with {} (peer registered)", .{peer_id}),
                             }
-                            const sk = try crypto.dh.X25519.scalarmult(client.keys.secret_key, pk);
-
-                            log.debug("shared secret: {}", .{fmt.fmtSliceHexLower(&sk)});
+                            client.conn.enableFlag(Connection.Flag.signed);
                         },
                         else => return error.UnexpectedTag,
                     }
@@ -405,8 +424,6 @@ const Client = struct {
     conn: Connection,
 
     keys: X25519.KeyPair,
-
-    peer_id: ?ID = null,
 
     fn init(
         allocator: Allocator,
@@ -442,15 +459,11 @@ const Client = struct {
     }
 
     pub fn write(self: *Client) !void {
-        log.debug("trying to flush..", .{});
         try self.conn.flush();
-        log.debug("flushed", .{});
     }
 
     fn assignPeerID(self: *Client, peer_id: ID) void {
-        self.peer_id = peer_id;
-        self.conn.context.peer_id = peer_id;
-        // self.conn.context.flags = Packet.Flag.signed; // TODO: double check and make sure it's there (also add encryption)
+        self.conn.peer_id = peer_id;
     }
 
     fn deinit(self: *Client, allocator: Allocator) void {
@@ -459,12 +472,17 @@ const Client = struct {
     }
 };
 
-const Connection = struct {
+pub const Connection = struct {
     const Self = @This();
     const log = std.log.scoped(.connection);
 
     pub const Error = error{
         PacketTooBig,
+    };
+    pub const Flag = struct {
+        const none: u8 = 0x0;
+        const signed: u8 = 0x1;
+        const encrypted: u8 = 0x2;
     };
 
     pub const Writer = std.io.Writer(*Self, Error, write);
@@ -477,11 +495,12 @@ const Connection = struct {
     read_start: usize = 0,
     read_end: usize = 0,
 
+    flags: u8 = Flag.none,
+    peer_id: ?ID = null,
+
     context: struct {
         socket: posix.socket_t,
         server_kp: *Ed25519.KeyPair,
-        peer_id: ID = undefined,
-        flags: u8 = Packet.Flag.none,
     },
 
     pub fn read(self: *Self, dest: []u8) !usize {
@@ -507,27 +526,26 @@ const Connection = struct {
                     return dest_index;
                 }
 
-                log.debug("read {} bytes; payload = {x}", .{ n, self.read_buffer[0..header.len] });
+                log.debug("read {} bytes in buffer", .{n});
 
                 // TODO: encryption flag
 
-                if (header.flags & Packet.Flag.signed != 0) {
+                if (header.flags & Flag.signed != 0) {
+                    const peer_id = self.peer_id orelse return error.EmptyPeerID;
                     var bytes: [Ed25519.Signature.encoded_length]u8 = undefined;
                     if (try in.read(&bytes) != bytes.len) {
                         return error.SignatureInvalid;
                     }
 
-                    log.debug("verifying signature {}", .{fmt.fmtSliceHexLower(&bytes)});
-
                     const sig = Ed25519.Signature.fromBytes(bytes);
-                    const pub_key = try Ed25519.PublicKey.fromBytes(self.context.peer_id.public_key);
+                    const pub_key = try Ed25519.PublicKey.fromBytes(peer_id.public_key);
 
                     sig.verify(self.read_buffer[0..header.len], pub_key) catch {
-                        log.warn("signature {} invalid for {}", .{ fmt.fmtSliceHexLower(&bytes), fmt.fmtSliceHexLower(&self.context.peer_id.public_key) });
+                        log.warn("verified signature from {} (invalid)", .{peer_id});
                         return error.SignatureInvalid;
                     };
 
-                    log.debug("signature match!", .{});
+                    log.debug("verified signature from {} (ok)", .{peer_id});
                 }
 
                 self.read_start = 0;
@@ -557,7 +575,7 @@ const Connection = struct {
 
         const header = Packet.Header{
             .len = @intCast(payload.len),
-            .flags = self.context.flags,
+            .flags = self.flags,
         };
 
         const stream = net.Stream{ .handle = self.context.socket };
@@ -566,17 +584,22 @@ const Connection = struct {
         try header.write(out.writer());
         try out.writer().writeAll(payload);
 
-        // TODO: make this mandatory after the handshake
-        if (header.flags & Packet.Flag.signed != 0) {
-            const sig = try self.context.server_kp.sign(out.buf[0..self.write_end], null); // TODO: add noise
-            log.debug("Packet: {x}, signature: {}", .{ payload, fmt.fmtSliceHexLower(&sig.toBytes()) });
+        if (header.flags & Flag.signed != 0) {
+            const sig = try self.context.server_kp.sign(payload, null); // TODO: add noise
             try out.writer().writeAll(&sig.toBytes());
-        } else {
-            log.debug("not signing packet", .{});
         }
 
         try out.flush();
         self.write_end = 0;
+    }
+
+    fn enableFlag(self: *Self, flag: u8) void {
+        if (self.flags & flag != 0x0) {
+            return;
+        }
+
+        self.flags |= flag;
+        log.debug("enabled flag {}", .{flag});
     }
 
     pub fn reader(self: *Self) Reader {
@@ -627,12 +650,6 @@ pub const Packet = struct {
         route,
     };
 
-    const Flag = struct {
-        const none: u8 = 0x0;
-        const signed: u8 = 0x1;
-        const encrypted: u8 = 0x2;
-    };
-
     op: Op,
     tag: Tag,
 
@@ -643,7 +660,6 @@ pub const Packet = struct {
     }
 
     pub fn read(reader: anytype) !Packet {
-        log.debug("trying to read packet..", .{});
         const op: Packet.Op = @enumFromInt(try reader.readInt(u8, .little));
         const tag: Packet.Tag = @enumFromInt(try reader.readInt(u8, .little));
 
@@ -651,7 +667,6 @@ pub const Packet = struct {
             .op = op,
             .tag = tag,
         };
-        log.debug("read packet: {}", .{packet});
         return packet;
     }
 };

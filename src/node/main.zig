@@ -211,7 +211,7 @@ fn bootstrapNodeWithPeers(node: *runtime.Node) !void {
         var client = try node.getOrCreateClient(peer_ids[i].address);
         try posix.setsockopt(client.socket, posix.SOL.SOCKET, posix.SOCK.NONBLOCK, &std.mem.toBytes(@as(c_int, 0)));
 
-        log.debug("findings node by quering {?}", .{client.peer_id});
+        log.debug("findings node by quering {?}", .{client.conn.peer_id});
         try (runtime.Packet{
             .op = .request,
             .tag = .find_nodes,
@@ -226,7 +226,7 @@ fn bootstrapNodeWithPeers(node: *runtime.Node) !void {
                 switch (response.tag) {
                     .find_nodes => {
                         const len = try client.reader().readInt(u8, .little);
-                        log.debug("{?} provided {} peers", .{ client.peer_id, len });
+                        log.debug("{?} provided {} peers", .{ client.conn.peer_id, len });
                         for (0..len) |_| {
                             const peer_id = runtime.ID.read(client.reader()) catch break;
                             _ = node.getOrCreateClient(peer_id.address) catch |err| {
