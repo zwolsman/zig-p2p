@@ -8,6 +8,7 @@ const system = std.posix.system;
 const fmt = std.fmt;
 
 const kademlia = @import("kademlia.zig");
+const e2e = @import("e2e.zig");
 
 const Allocator = std.mem.Allocator;
 const X25519 = crypto.dh.X25519;
@@ -162,11 +163,8 @@ pub const Node = struct {
                 switch (packet.tag) {
                     .hello => {
                         const peer_id = try ID.read(client.reader());
-                        log.debug("received id: {}", .{peer_id});
                         const pk = try client.reader().readBytesNoEof(32);
-                        log.debug("received pk {} from {}", .{ fmt.fmtSliceHexLower(&pk), peer_id });
                         const sk = try crypto.dh.X25519.scalarmult(client.keys.secret_key, pk);
-                        log.debug("shared secret: {}", .{fmt.fmtSliceHexLower(&sk)}); //TODO: use shared key
 
                         const peer_sig = Ed25519.Signature.fromBytes(try client.reader().readBytesNoEof(Ed25519.Signature.encoded_length));
                         try peer_sig.verify(client.conn.read_buffer[0 .. client.conn.read_end - Ed25519.Signature.encoded_length], try Ed25519.PublicKey.fromBytes(peer_id.public_key));
@@ -194,6 +192,7 @@ pub const Node = struct {
                         try client.write();
 
                         client.conn.enableFlag(Connection.Flag.signed);
+                        try client.conn.enableEncryptionWithRemoteKey(sk, pk);
                     },
                     .find_nodes => {
                         const public_key = try client.reader().readBytesNoEof(32);
@@ -375,12 +374,7 @@ pub const Node = struct {
                             const peer_id = try ID.read(client.reader());
                             client.assignPeerID(peer_id);
                             const pk = try client.reader().readBytesNoEof(32);
-
-                            log.debug("received pk {} from {}", .{ fmt.fmtSliceHexLower(&pk), peer_id });
-
-                            // TODO: toggle encryption
                             const sk = try crypto.dh.X25519.scalarmult(client.keys.secret_key, pk);
-                            log.debug("shared secret: {}", .{fmt.fmtSliceHexLower(&sk)});
 
                             const sig_bytes = try client.reader().readBytesNoEof(Ed25519.Signature.encoded_length);
                             const peer_sig = Ed25519.Signature.fromBytes(sig_bytes);
@@ -394,6 +388,7 @@ pub const Node = struct {
                                 .inserted => log.info("handshaked with {} (peer registered)", .{peer_id}),
                             }
                             client.conn.enableFlag(Connection.Flag.signed);
+                            try client.conn.enableEncryptionWithKeyPair(sk, client.keys);
                         },
                         else => return error.UnexpectedTag,
                     }
@@ -476,6 +471,9 @@ pub const Connection = struct {
     const Self = @This();
     const log = std.log.scoped(.connection);
 
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const allocator = gpa.allocator();
+
     pub const Error = error{
         PacketTooBig,
     };
@@ -496,7 +494,9 @@ pub const Connection = struct {
     read_end: usize = 0,
 
     flags: u8 = Flag.none,
+
     peer_id: ?ID = null,
+    session: ?e2e.Session = null,
 
     context: struct {
         socket: posix.socket_t,
@@ -515,7 +515,12 @@ pub const Connection = struct {
                 const stream = net.Stream{ .handle = self.context.socket };
                 var in = stream.reader();
                 const header = try Packet.Header.read(in);
+                var encryption_header: ?Packet.EncryptionHeader = null;
+
                 log.debug("read header: {}", .{header});
+                if (header.flags & Flag.encrypted != 0x0) {
+                    encryption_header = try Packet.EncryptionHeader.read(in);
+                }
 
                 // read body
                 const n = try in.read(self.read_buffer[0..header.len]);
@@ -527,8 +532,6 @@ pub const Connection = struct {
                 }
 
                 log.debug("read {} bytes in buffer", .{n});
-
-                // TODO: encryption flag
 
                 if (header.flags & Flag.signed != 0) {
                     const peer_id = self.peer_id orelse return error.EmptyPeerID;
@@ -548,8 +551,27 @@ pub const Connection = struct {
                     log.debug("verified signature from {} (ok)", .{peer_id});
                 }
 
-                self.read_start = 0;
-                self.read_end = header.len;
+                if (header.flags & Flag.encrypted != 0) {
+                    var session = self.session orelse return error.MissingSession;
+                    const h = encryption_header orelse return error.MissingEncryptionHeader;
+
+                    const result = try session.decrypt(.{
+                        .dh = h.dh,
+                        .n = h.n,
+                        .pn = h.pn,
+
+                        .cipher_text = self.read_buffer[0..header.len],
+                    });
+
+                    @memcpy(self.read_buffer[0..result.len], result);
+                    self.read_start = 0;
+                    self.read_end = result.len;
+
+                    log.debug("dencrypted packet!", .{});
+                } else {
+                    self.read_start = 0;
+                    self.read_end = header.len;
+                }
             }
 
             self.read_start += written;
@@ -571,10 +593,23 @@ pub const Connection = struct {
     }
 
     fn flush(self: *Self) !void {
-        const payload = self.write_buffer[0..self.write_end];
+        var data_to_write = self.write_buffer[0..self.write_end];
+        var encryption_header: ?Packet.EncryptionHeader = null;
+
+        if (self.flags & Flag.encrypted != 0x0) {
+            var session = self.session orelse return error.MissingSession;
+            const result = try session.encrypt(data_to_write);
+            data_to_write = result.cipher_text[0..];
+            encryption_header = .{
+                .dh = result.dh,
+                .n = result.n,
+                .pn = result.pn,
+            };
+            log.debug("encrypted packet!", .{});
+        }
 
         const header = Packet.Header{
-            .len = @intCast(payload.len),
+            .len = @intCast(data_to_write.len),
             .flags = self.flags,
         };
 
@@ -582,10 +617,14 @@ pub const Connection = struct {
         var out = std.io.bufferedWriter(stream.writer());
 
         try header.write(out.writer());
-        try out.writer().writeAll(payload);
+        if (encryption_header) |h| {
+            try h.write(out.writer());
+        }
 
-        if (header.flags & Flag.signed != 0) {
-            const sig = try self.context.server_kp.sign(payload, null); // TODO: add noise
+        try out.writer().writeAll(data_to_write);
+
+        if (self.flags & Flag.signed != 0) {
+            const sig = try self.context.server_kp.sign(data_to_write, null); // TODO: add noise
             try out.writer().writeAll(&sig.toBytes());
         }
 
@@ -602,12 +641,38 @@ pub const Connection = struct {
         log.debug("enabled flag {}", .{flag});
     }
 
+    /// Enables encryption using a remote public key.
+    fn enableEncryptionWithRemoteKey(conn: *Self, shared_key: [32]u8, remote_key: [32]u8) !void {
+        var session_id = generateSessionId();
+
+        conn.session = try e2e.initRemoteKey(allocator, &session_id, shared_key, remote_key);
+        log.debug("init e2e session ({}) with shared key {} (ok)", .{ fmt.fmtSliceHexLower(&session_id), fmt.fmtSliceHexLower(&shared_key) });
+        conn.flags |= Flag.encrypted;
+    }
+
+    /// Enables encryption using an X25519 key pair.
+    fn enableEncryptionWithKeyPair(conn: *Self, shared_key: [32]u8, keys: X25519.KeyPair) !void {
+        var session_id = generateSessionId();
+
+        log.debug("init e2e session ({}) with shared key {} (ok)", .{ fmt.fmtSliceHexLower(&session_id), fmt.fmtSliceHexLower(&shared_key) });
+
+        conn.session = e2e.init(allocator, &session_id, shared_key, keys);
+        conn.flags |= Flag.encrypted;
+    }
+
     pub fn reader(self: *Self) Reader {
         return .{ .context = self };
     }
 
     pub fn writer(self: *Self) Writer {
         return .{ .context = self };
+    }
+
+    /// Generates a random session ID.
+    fn generateSessionId() [16]u8 {
+        var session_id: [16]u8 = undefined;
+        crypto.random.bytes(&session_id);
+        return session_id;
     }
 };
 
@@ -630,9 +695,36 @@ pub const Packet = struct {
         fn read(reader: anytype) !Header {
             const len = try reader.readInt(u32, .little);
             const flags = try reader.readInt(u8, .little);
+
             return .{
                 .len = len,
                 .flags = flags,
+            };
+        }
+    };
+
+    pub const EncryptionHeader = struct {
+        const size = @sizeOf([32]u8) + @sizeOf(u32) + @sizeOf(u32);
+
+        dh: [32]u8,
+        n: u32,
+        pn: u32,
+
+        fn write(h: EncryptionHeader, writer: anytype) !void {
+            try writer.writeAll(&h.dh);
+            try writer.writeInt(u32, h.n, .little);
+            try writer.writeInt(u32, h.pn, .little);
+        }
+
+        fn read(reader: anytype) !EncryptionHeader {
+            const dh = try reader.readBytesNoEof(32);
+            const n = try reader.readInt(u32, .little);
+            const pn = try reader.readInt(u32, .little);
+
+            return .{
+                .dh = dh,
+                .n = n,
+                .pn = pn,
             };
         }
     };
