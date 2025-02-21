@@ -288,7 +288,7 @@ pub const Node = struct {
         posix.close(self.listener);
         var client_it = self.clients.valueIterator();
         while (client_it.next()) |client_ptr| {
-            log.info("shutting down client {}...", .{client_ptr.*.socket});
+            log.info("shutting down client {}...", .{client_ptr.*.conn.socket});
             self.closeClient(client_ptr.*);
         }
     }
@@ -301,10 +301,10 @@ pub const Node = struct {
                 log.debug("closing client {}", .{peer_id});
             }
         } else {
-            log.debug("closing client {}", .{client.socket});
+            log.debug("closing client {}", .{client.conn.socket});
         }
 
-        posix.close(client.socket);
+        posix.close(client.conn.socket);
         client.deinit(self.allocator);
         self.client_pool.destroy(client);
     }
@@ -320,7 +320,7 @@ pub const Node = struct {
         const client = try self.createClient(socket, address);
         try self.loop.newClient(client);
 
-        log.info("Accepted client: {}", .{client.socket});
+        log.info("Accepted client: {}", .{client.conn.socket});
     }
 
     fn createClient(self: *Node, socket: posix.socket_t, address: net.Address) !*Client {
@@ -407,14 +407,9 @@ pub const Node = struct {
 
 const Client = struct {
     const log = std.log.scoped(.client);
-    const BufferedWriter = std.io.BufferedWriter(Packet.max_len, net.Stream.Writer);
-    const BufferedReader = std.io.BufferedReader(4096, net.Stream.Reader);
-    const Writer = BufferedWriter.Writer;
-    const Reader = BufferedReader.Reader;
 
     loop: *KQueue,
     address: net.Address,
-    socket: posix.socket_t,
 
     conn: Connection,
 
@@ -434,13 +429,10 @@ const Client = struct {
         return .{
             .loop = loop,
             .address = address,
-            .socket = socket,
             .keys = keys,
             .conn = .{
-                .context = .{
-                    .socket = socket,
-                    .server_kp = server_kp,
-                },
+                .socket = socket,
+                .server_kp = server_kp,
             },
         };
     }
@@ -497,13 +489,10 @@ pub const Connection = struct {
 
     peer_id: ?ID = null,
     session: ?e2e.Session = null,
+    socket: posix.socket_t,
+    server_kp: *Ed25519.KeyPair,
 
-    context: struct {
-        socket: posix.socket_t,
-        server_kp: *Ed25519.KeyPair,
-    },
-
-    pub fn read(self: *Self, dest: []u8) !usize {
+    fn read(self: *Self, dest: []u8) !usize {
         var dest_index: usize = 0;
 
         while (dest_index < dest.len) {
@@ -512,7 +501,7 @@ pub const Connection = struct {
             @memcpy(dest[dest_index..][0..written], self.read_buffer[self.read_start..][0..written]);
             if (written == 0) {
                 // buffer empty, read a *whole* packet in buffer
-                const stream = net.Stream{ .handle = self.context.socket };
+                const stream = net.Stream{ .handle = self.socket };
                 var in = stream.reader();
                 const header = try Packet.Header.read(in);
                 var encryption_header: ?Packet.EncryptionHeader = null;
@@ -581,7 +570,7 @@ pub const Connection = struct {
         return dest.len;
     }
 
-    pub fn write(self: *Self, bytes: []const u8) Error!usize {
+    fn write(self: *Self, bytes: []const u8) Error!usize {
         if (self.write_end + bytes.len > self.write_buffer.len) {
             return error.PacketTooBig;
         }
@@ -613,7 +602,7 @@ pub const Connection = struct {
             .flags = self.flags,
         };
 
-        const stream = net.Stream{ .handle = self.context.socket };
+        const stream = net.Stream{ .handle = self.socket };
         var out = std.io.bufferedWriter(stream.writer());
 
         try header.write(out.writer());
@@ -624,7 +613,7 @@ pub const Connection = struct {
         try out.writer().writeAll(data_to_write);
 
         if (self.flags & Flag.signed != 0) {
-            const sig = try self.context.server_kp.sign(data_to_write, null); // TODO: add noise
+            const sig = try self.server_kp.sign(data_to_write, null); // TODO: add noise
             try out.writer().writeAll(&sig.toBytes());
         }
 
@@ -847,7 +836,7 @@ const KQueue = struct {
 
     fn newClient(self: *KQueue, client: *Client) !void {
         try self.queueChange(.{
-            .ident = @intCast(client.socket),
+            .ident = @intCast(client.conn.socket),
             .filter = posix.system.EVFILT_READ,
             .flags = posix.system.EV_ADD,
             .fflags = 0,
@@ -856,7 +845,7 @@ const KQueue = struct {
         });
 
         try self.queueChange(.{
-            .ident = @intCast(client.socket),
+            .ident = @intCast(client.conn.socket),
             .filter = posix.system.EVFILT_WRITE,
             .flags = posix.system.EV_ADD | posix.system.EV_DISABLE,
             .fflags = 0,
@@ -867,7 +856,7 @@ const KQueue = struct {
 
     fn readMode(self: *KQueue, client: *Client) !void {
         try self.queueChange(.{
-            .ident = @intCast(client.socket),
+            .ident = @intCast(client.conn.socket),
             .filter = posix.system.EVFILT_WRITE,
             .flags = posix.system.EV_DISABLE,
             .fflags = 0,
@@ -876,7 +865,7 @@ const KQueue = struct {
         });
 
         try self.queueChange(.{
-            .ident = @intCast(client.socket),
+            .ident = @intCast(client.conn.socket),
             .filter = posix.system.EVFILT_READ,
             .flags = posix.system.EV_ENABLE,
             .fflags = 0,
@@ -887,7 +876,7 @@ const KQueue = struct {
 
     fn writeMode(self: *KQueue, client: *Client) !void {
         try self.queueChange(.{
-            .ident = @intCast(client.socket),
+            .ident = @intCast(client.conn.socket),
             .filter = posix.system.EVFILT_READ,
             .flags = posix.system.EV_DISABLE,
             .fflags = 0,
@@ -896,7 +885,7 @@ const KQueue = struct {
         });
 
         try self.queueChange(.{
-            .ident = @intCast(client.socket),
+            .ident = @intCast(client.conn.socket),
             .filter = posix.system.EVFILT_WRITE,
             .flags = posix.system.EV_ENABLE,
             .fflags = 0,
