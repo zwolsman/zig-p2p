@@ -97,8 +97,6 @@ fn openTty(n: *runtime.Node) void {
                     };
 
                     (runtime.Packet{
-                        .len = @sizeOf([32]u8) + @sizeOf([32]u8) + @sizeOf(u8),
-                        .flags = 0x1, // signed
                         .op = .command,
                         .tag = .route,
                     }).write(client.writer()) catch continue;
@@ -215,8 +213,6 @@ fn bootstrapNodeWithPeers(node: *runtime.Node) !void {
 
         log.debug("findings node by quering {?}", .{client.peer_id});
         try (runtime.Packet{
-            .len = 32,
-            .flags = 0x1,
             .op = .request,
             .tag = .find_nodes,
         }).write(client.writer());

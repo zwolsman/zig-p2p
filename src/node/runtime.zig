@@ -178,8 +178,6 @@ pub const Node = struct {
                         log.debug("shared secret: {}", .{fmt.fmtSliceHexLower(&sk)}); //TODO: use shared key
 
                         try (Packet{
-                            .len = self.id.size() + 32,
-                            .flags = 0x0,
                             .op = .response,
                             .tag = .hello,
                         }).write(client.writer());
@@ -201,8 +199,6 @@ pub const Node = struct {
                         }
 
                         try (Packet{
-                            .len = len,
-                            .flags = 0,
                             .op = .response,
                             .tag = .find_nodes,
                         }).write(client.writer());
@@ -258,8 +254,6 @@ pub const Node = struct {
                         const c = try self.getOrCreateClient(peer_id.address);
 
                         try (Packet{
-                            .len = packet.len + self.id.size(),
-                            .flags = 0x0,
                             .op = .command,
                             .tag = .route,
                         }).write(c.writer());
@@ -352,8 +346,6 @@ pub const Node = struct {
             errdefer client.deinit(self.allocator);
 
             try (Packet{
-                .len = self.id.size() + 32,
-                .flags = 0,
                 .op = .request,
                 .tag = .hello,
             }).write(client.writer());
@@ -478,27 +470,24 @@ const ClientWriter = struct {
     },
 
     fn flush(self: *Self) !void {
-        const packet = self.buffer[0..Packet.size]; // TODO: change flags
-        const flags = std.mem.readInt(u8, self.buffer[4..5], .little); // TODO: fix this
-        const payload = self.buffer[Packet.size..self.end];
+        const payload = self.buffer[0..self.end];
+        const flags = 0x0; // TODO: use correct flags
+
+        const header = Packet.Header{
+            .len = @intCast(payload.len),
+            .flags = flags,
+        };
 
         const stream = net.Stream{ .handle = self.context.socket };
         var out = std.io.bufferedWriter(stream.writer());
 
-        const provided_len = @as(usize, std.mem.readInt(u32, packet[0..4], .little));
-        if (provided_len != payload.len) {
-            log.warn("packet len is not set to the same at the payload ({} != {})", .{ provided_len, payload.len });
-        } else {
-            log.debug("packet len matches ({} == {})", .{ provided_len, payload.len });
-        }
-
-        try out.writer().writeAll(packet);
+        try header.write(out.writer());
         try out.writer().writeAll(payload);
 
         // TODO: make this mandatory after the handshake
         if (flags & Packet.Flag.signed != 0) {
             const sig = try self.context.server_kp.sign(out.buf[0..self.end], null); // TODO: add noise
-            log.debug("Packet: {x}, payload: {x}, signature: {}", .{ packet, payload, fmt.fmtSliceHexLower(&sig.toBytes()) });
+            log.debug("Packet: {x}, signature: {}", .{ payload, fmt.fmtSliceHexLower(&sig.toBytes()) });
             try out.writer().writeAll(&sig.toBytes());
         } else {
             log.debug("not signing packet", .{});
@@ -555,28 +544,23 @@ const ClientReader = struct {
                 // buffer empty, read a *whole* packet in buffer
                 const stream = net.Stream{ .handle = self.context.socket };
                 var in = stream.reader();
+                const header = try Packet.Header.read(in);
+                log.debug("read header: {}", .{header});
 
-                // read packet (TODO: do this in a structured way..)
-                _ = try in.read(self.buffer[0..Packet.size]);
+                // read body
+                const n = try in.read(self.buffer[0..header.len]);
 
-                const len = std.mem.readInt(u32, self.buffer[0..4], .little);
-                log.debug("parsed len: {}", .{len});
-
-                const flags = std.mem.readInt(u8, self.buffer[4..5], .little);
-
-                // read payload
-                const n = try in.read(self.buffer[Packet.size .. Packet.size + len]); // read the payload
-
-                log.debug("read {} bytes ({x})", .{ n, self.buffer[Packet.size .. Packet.size + len] });
                 if (n == 0) {
                     // reading from the unbuffered stream returned nothing
                     // so we have nothing left to read.
                     return dest_index;
                 }
 
+                log.debug("read {} bytes; payload = {x}", .{ n, self.buffer[0..header.len] });
+
                 // TODO: encryption flag
 
-                if (flags & Packet.Flag.signed != 0) {
+                if (header.flags & Packet.Flag.signed != 0) {
                     var bytes: [Ed25519.Signature.encoded_length]u8 = undefined;
                     if (try in.read(&bytes) != bytes.len) {
                         return error.SignatureInvalid;
@@ -587,7 +571,7 @@ const ClientReader = struct {
                     const sig = Ed25519.Signature.fromBytes(bytes);
                     const pub_key = try Ed25519.PublicKey.fromBytes(self.context.peer_id.public_key);
 
-                    sig.verify(self.buffer[0 .. Packet.size + n], pub_key) catch {
+                    sig.verify(self.buffer[0..header.len], pub_key) catch {
                         log.warn("signature {} invalid for {}", .{ fmt.fmtSliceHexLower(&bytes), fmt.fmtSliceHexLower(&self.context.peer_id.public_key) });
                         return error.SignatureInvalid;
                     };
@@ -596,8 +580,9 @@ const ClientReader = struct {
                 }
 
                 self.start = 0;
-                self.end = Packet.size + n;
+                self.end = header.len;
             }
+
             self.start += written;
             dest_index += written;
         }
@@ -613,7 +598,28 @@ const ClientReader = struct {
 pub const Packet = struct {
     const log = std.log.scoped(.packet);
     const max_len = 1024;
-    const size = @sizeOf(u32) + @sizeOf(u8) + @sizeOf(u8) + @sizeOf(u8);
+    const size = @sizeOf(u8) + @sizeOf(u8);
+
+    pub const Header = struct {
+        const size = @sizeOf(u32) + @sizeOf(u8);
+
+        len: u32,
+        flags: u8,
+
+        fn write(h: Header, writer: anytype) !void {
+            try writer.writeInt(u32, h.len, .little);
+            try writer.writeInt(u8, h.flags, .little);
+        }
+
+        fn read(reader: anytype) !Header {
+            const len = try reader.readInt(u32, .little);
+            const flags = try reader.readInt(u8, .little);
+            return .{
+                .len = len,
+                .flags = flags,
+            };
+        }
+    };
 
     const Op = enum(u8) {
         request,
@@ -634,18 +640,10 @@ pub const Packet = struct {
         const encrypted: u8 = 0x2;
     };
 
-    len: u32,
-    flags: u8,
     op: Op,
     tag: Tag,
 
     pub fn write(p: Packet, writer: anytype) !void {
-        if (p.len > Packet.max_len) {
-            return error.PacketTooBig;
-        }
-
-        try writer.writeInt(u32, p.len, .little);
-        try writer.writeInt(u8, p.flags, .little);
         try writer.writeInt(u8, @intFromEnum(p.op), .little);
         try writer.writeInt(u8, @intFromEnum(p.tag), .little);
         log.debug("wrote packet: {}", .{p});
@@ -653,18 +651,10 @@ pub const Packet = struct {
 
     pub fn read(reader: anytype) !Packet {
         log.debug("trying to read packet..", .{});
-        const len = try reader.readInt(u32, .little);
-        if (len > Packet.max_len) {
-            return error.PacketTooBig;
-        }
-
-        const flags = try reader.readInt(u8, .little);
         const op: Packet.Op = @enumFromInt(try reader.readInt(u8, .little));
         const tag: Packet.Tag = @enumFromInt(try reader.readInt(u8, .little));
 
         const packet = Packet{
-            .len = len,
-            .flags = flags,
             .op = op,
             .tag = tag,
         };
