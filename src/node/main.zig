@@ -96,14 +96,24 @@ fn openTty(n: *runtime.Node) void {
                         continue;
                     };
 
+                    var route = runtime.Router.createRoute(alloc, node, public_key) catch |err| {
+                        log.err("could not create route: {}", .{err});
+                        continue;
+                    };
+
+                    var w = route.writer();
+
+                    //Start route packet
                     (runtime.Packet{
                         .op = .command,
-                        .tag = .route,
-                    }).write(client.writer()) catch continue;
-                    client.writer().writeAll(&node.id.public_key) catch continue;
-                    client.writer().writeAll(&public_key) catch continue;
+                        .tag = .echo,
+                    }).write(w) catch continue;
 
-                    client.writer().writeInt(u8, 0, .little) catch continue;
+                    const msg = "testing 123";
+                    w.writeInt(u8, msg.len, .little) catch continue;
+                    w.writeAll(msg) catch continue;
+                    route.write(client.conn.writer()) catch continue;
+
                     client.write() catch continue;
 
                     std.debug.print("sent route cmd to {}\n", .{peer_id});

@@ -46,7 +46,7 @@ pub const ID = struct {
         }
     }
 
-    pub fn read(reader: Connection.Reader) !ID {
+    pub fn read(reader: anytype) !ID {
         var id: ID = undefined;
         id.public_key = try reader.readBytesNoEof(32);
 
@@ -224,32 +224,25 @@ pub const Node = struct {
             .command => {
                 switch (packet.tag) {
                     .route => {
-                        const src = try client.reader().readBytesNoEof(32);
-                        const dst = try client.reader().readBytesNoEof(32);
-                        const count = try client.reader().readInt(u8, .little);
-                        if (count > 16) {
-                            return error.TooManyHops;
-                        }
+                        const route = try Router.readRoute(self.allocator, client.reader(), @intCast(client.conn.read_end)); // TODO: remove hacky read_end
 
-                        var hops: [16]ID = undefined;
-                        for (0..count) |i| {
-                            hops[i] = try ID.read(client.reader());
-                        }
+                        if (std.mem.eql(u8, &self.id.public_key, &route.dst)) {
+                            log.debug("ack route from {}", .{fmt.fmtSliceHexLower(&route.src)});
+                            log.debug("having to decrypt body: {x}", .{route.body});
 
-                        log.debug("{} => {} (hops: {any})", .{ fmt.fmtSliceHexLower(&src), fmt.fmtSliceHexLower(&dst), hops[0..count] });
-                        if (std.mem.eql(u8, &self.id.public_key, &dst)) {
-                            log.debug("ack route from {}", .{fmt.fmtSliceHexLower(&src)});
+                            const result = try Router.decrypt(self.allocator, self, route.src, route.ph, route.eh, route.body);
+                            log.debug("decrypted: {s} ({x})", .{ result, result });
                             return;
                         }
 
                         const peer_id = pid: {
-                            if (self.routing_table.get(dst)) |peer_id| {
+                            if (self.routing_table.get(route.dst)) |peer_id| {
                                 break :pid peer_id;
                             } else {
                                 var peer_ids: [16]ID = undefined;
-                                const n = self.routing_table.closestTo(&peer_ids, dst);
+                                const n = self.routing_table.closestTo(&peer_ids, route.dst);
                                 if (n == 0) {
-                                    log.warn("could not route to {}", .{fmt.fmtSliceHexLower(&dst)});
+                                    log.warn("could not route to {}", .{fmt.fmtSliceHexLower(&route.dst)});
                                     return;
                                 }
                                 break :pid peer_ids[0]; // TODO: pick random peer
@@ -265,15 +258,20 @@ pub const Node = struct {
                             .tag = .route,
                         }).write(c.writer());
 
-                        try c.writer().writeAll(&src);
-                        try c.writer().writeAll(&dst);
+                        try c.writer().writeAll(&route.src);
+                        try c.writer().writeAll(&route.dst);
 
-                        try c.writer().writeInt(u8, count + 1, .little);
-                        for (0..count) |i| {
-                            try hops[i].write(c.writer());
+                        try c.writer().writeInt(u8, @intCast(route.hops.len + 1), .little);
+                        for (route.hops) |hop| {
+                            try hop.write(c.writer());
                         }
 
                         try self.id.write(c.writer());
+
+                        // Just passing it along! Nothing to do here :)
+                        try route.ph.write(c.writer());
+                        try route.eh.write(c.writer());
+                        try c.writer().writeAll(route.body);
 
                         try c.write();
                     },
@@ -557,6 +555,7 @@ pub const Connection = struct {
                     self.read_end = result.len;
 
                     log.debug("dencrypted packet!", .{});
+                    log.debug("data: {x}", .{result});
                 } else {
                     self.read_start = 0;
                     self.read_end = header.len;
@@ -617,7 +616,9 @@ pub const Connection = struct {
             try out.writer().writeAll(&sig.toBytes());
         }
 
+        log.debug("data written: {x}", .{out.buf[0..out.end]});
         try out.flush();
+
         self.write_end = 0;
     }
 
@@ -665,6 +666,129 @@ pub const Connection = struct {
     }
 };
 
+pub const Router = struct {
+    const log = std.log.scoped(.router);
+    const Buffer = std.ArrayList(u8);
+
+    buff: Buffer,
+    src: [32]u8,
+    dst: [32]u8,
+    hops: []ID,
+    session: e2e.Session,
+
+    pub fn createRoute(allocator: std.mem.Allocator, node: *Node, dst: [32]u8) !Router {
+        const dst_pub = try X25519.publicKeyFromEd25519(try Ed25519.PublicKey.fromBytes(dst));
+        const keys = try X25519.KeyPair.fromEd25519(node.keys);
+
+        const sk = try X25519.scalarmult(keys.secret_key, dst_pub);
+        log.debug("route sk: {}", .{fmt.fmtSliceHexLower(&sk)});
+
+        return .{
+            .src = node.id.public_key,
+            .dst = dst,
+            .session = try e2e.initRemoteKey(allocator, "test", sk, dst_pub),
+            .buff = Buffer.init(allocator),
+            .hops = &[0]ID{},
+        };
+    }
+
+    pub fn readRoute(allocator: std.mem.Allocator, r: Connection.Reader, size: u32) !struct {
+        hops: []ID,
+        src: [32]u8,
+        dst: [32]u8,
+        ph: Packet.Header,
+        eh: Packet.EncryptionHeader,
+        body: []u8,
+    } {
+        _ = size; // autofix
+        var in = std.io.countingReader(r);
+        const src = try in.reader().readBytesNoEof(32);
+        const dst = try in.reader().readBytesNoEof(32);
+        const count = try in.reader().readInt(u8, .little);
+        if (count > 16) {
+            return error.TooManyHops;
+        }
+
+        var hops: [16]ID = undefined;
+        for (0..count) |i| {
+            hops[i] = try ID.read(in.reader());
+        }
+
+        log.debug("{} => {} (hops: {any})", .{ fmt.fmtSliceHexLower(&src), fmt.fmtSliceHexLower(&dst), hops[0..count] });
+        // const body = try allocator.alloc(u8, size - in.bytes_read + Packet.Header.size + Packet.EncryptionHeader.size); // minus IV len + sig len (because it's encrypted.. yikes >.<)
+        // log.debug("want to read {} bytes", .{body.len});
+        // _ = try in.reader().readAll(body);
+        // log.debug("body: {x}", .{body});
+
+        const ph = try Packet.Header.read(in.reader());
+        const eh = try Packet.EncryptionHeader.read(in.reader());
+        log.debug("ph: {}, eh: {}", .{ ph, eh });
+        const body = try allocator.alloc(u8, ph.len);
+        _ = try in.reader().readAll(body);
+
+        return .{
+            .hops = hops[0..count],
+            .src = src,
+            .dst = dst,
+            .ph = ph,
+            .eh = eh,
+            .body = body,
+        };
+    }
+
+    pub fn decrypt(allocator: std.mem.Allocator, node: *Node, src: [32]u8, ph: Packet.Header, eh: Packet.EncryptionHeader, cipher_text: []u8) ![]u8 {
+        _ = ph; // autofix
+        const keys = try X25519.KeyPair.fromEd25519(node.keys);
+        const src_pub = try X25519.publicKeyFromEd25519(try Ed25519.PublicKey.fromBytes(src));
+        const sk = try X25519.scalarmult(keys.secret_key, src_pub);
+        log.debug("route sk: {}", .{fmt.fmtSliceHexLower(&sk)});
+
+        var session = e2e.init(allocator, "test-2", sk, keys);
+
+        const plain_text = try session.decrypt(.{
+            .dh = eh.dh,
+            .n = eh.n,
+            .pn = eh.pn,
+            .cipher_text = cipher_text,
+        });
+
+        return plain_text;
+    }
+
+    pub fn writer(self: *Router) Buffer.Writer {
+        return self.buff.writer();
+    }
+
+    pub fn write(self: *Router, w: Connection.Writer) !void {
+        try (Packet{
+            .op = .command,
+            .tag = .route,
+        }).write(w);
+
+        try w.writeAll(&self.src);
+        try w.writeAll(&self.dst);
+
+        // amount of hops
+        try w.writeInt(u8, 0, .little);
+
+        // TODO: this is duplication of client writer
+        const result = try self.session.encrypt(self.buff.items);
+
+        try (Packet.Header{
+            .len = @intCast(result.cipher_text.len),
+            .flags = Connection.Flag.encrypted,
+        }).write(w);
+
+        try (Packet.EncryptionHeader{
+            .dh = result.dh,
+            .n = result.n,
+            .pn = result.pn,
+        }).write(w);
+
+        try w.writeAll(result.cipher_text);
+        // TODO: siggy!
+    }
+};
 pub const Packet = struct {
     const log = std.log.scoped(.packet);
     const max_len = 1024;
@@ -729,6 +853,7 @@ pub const Packet = struct {
         hello,
         find_nodes,
         route,
+        echo,
     };
 
     op: Op,
