@@ -45,7 +45,7 @@ pub const ID = struct {
         }
     }
 
-    pub fn read(reader: Client.Reader) !ID {
+    pub fn read(reader: ClientReader.Reader) !ID {
         var id: ID = undefined;
         id.public_key = try reader.readBytesNoEof(32);
 
@@ -162,7 +162,8 @@ pub const Node = struct {
                 switch (packet.tag) {
                     .hello => {
                         const peer_id = try ID.read(client.reader());
-                        client.peer_id = peer_id;
+                        log.debug("received id: {}", .{peer_id});
+                        client.assignPeerID(peer_id);
                         const pk = try client.reader().readBytesNoEof(32);
                         log.debug("received pk {} from {}", .{ fmt.fmtSliceHexLower(&pk), peer_id });
 
@@ -177,7 +178,7 @@ pub const Node = struct {
                         log.debug("shared secret: {}", .{fmt.fmtSliceHexLower(&sk)}); //TODO: use shared key
 
                         try (Packet{
-                            .len = self.id.size(),
+                            .len = self.id.size() + 32,
                             .flags = 0x0,
                             .op = .response,
                             .tag = .hello,
@@ -351,7 +352,7 @@ pub const Node = struct {
             errdefer client.deinit(self.allocator);
 
             try (Packet{
-                .len = 32,
+                .len = self.id.size() + 32,
                 .flags = 0,
                 .op = .request,
                 .tag = .hello,
@@ -373,7 +374,7 @@ pub const Node = struct {
 
                             log.debug("received pk {} from {}", .{ fmt.fmtSliceHexLower(&pk), peer_id });
 
-                            client.peer_id = peer_id;
+                            client.assignPeerID(peer_id);
                             switch (self.routing_table.put(peer_id)) {
                                 .full => log.info("handshaked with {} (peer ignored)", .{peer_id}),
                                 .updated => log.info("handshaked with {} (peer updated)", .{peer_id}),
@@ -409,8 +410,8 @@ const Client = struct {
     address: net.Address,
     socket: posix.socket_t,
 
-    reader_stream: BufferedReader,
     client_writer: ClientWriter,
+    client_reader: ClientReader,
 
     keys: X25519.KeyPair,
 
@@ -425,34 +426,32 @@ const Client = struct {
     ) !Client {
         _ = allocator; // autofix
 
-        const stream = net.Stream{ .handle = socket };
         const keys = try X25519.KeyPair.create(null); // generate new KP for each client (used for e2e)
-        return .{
-            .loop = loop,
-            .address = address,
+        return .{ .loop = loop, .address = address, .socket = socket, .keys = keys, .client_writer = .{ .context = .{
             .socket = socket,
-            .keys = keys,
-
-            .reader_stream = BufferedReader{ .unbuffered_reader = stream.reader() },
-            .client_writer = .{ .context = .{
-                .socket = socket,
-                .server_kp = server_kp,
-            } },
-        };
+            .server_kp = server_kp,
+        } }, .client_reader = .{ .context = .{
+            .socket = socket,
+        } } };
     }
 
     pub fn writer(self: *Client) ClientWriter.Writer {
         return self.client_writer.writer();
     }
 
-    pub fn reader(self: *Client) Reader {
-        return .{ .context = &self.reader_stream };
+    pub fn reader(self: *Client) ClientReader.Reader {
+        return self.client_reader.reader();
     }
 
     pub fn write(self: *Client) !void {
         log.debug("trying to flush..", .{});
         try self.client_writer.flush();
         log.debug("flushed", .{});
+    }
+
+    fn assignPeerID(self: *Client, peer_id: ID) void {
+        self.peer_id = peer_id;
+        self.client_reader.context.peer_id = peer_id;
     }
 
     fn deinit(self: *Client, allocator: Allocator) void {
@@ -479,17 +478,31 @@ const ClientWriter = struct {
     },
 
     fn flush(self: *Self) !void {
-        const packet = self.buffer[0..Packet.size];
+        const packet = self.buffer[0..Packet.size]; // TODO: change flags
+        const flags = std.mem.readInt(u8, self.buffer[4..5], .little); // TODO: fix this
         const payload = self.buffer[Packet.size..self.end];
 
         const stream = net.Stream{ .handle = self.context.socket };
         var out = std.io.bufferedWriter(stream.writer());
 
+        const provided_len = @as(usize, std.mem.readInt(u32, packet[0..4], .little));
+        if (provided_len != payload.len) {
+            log.warn("packet len is not set to the same at the payload ({} != {})", .{ provided_len, payload.len });
+        } else {
+            log.debug("packet len matches ({} == {})", .{ provided_len, payload.len });
+        }
+
         try out.writer().writeAll(packet);
         try out.writer().writeAll(payload);
 
-        const sig = try self.context.server_kp.sign(&out.buf, null); // TODO: add noise
-        log.debug("Packet: {x}, payload: {x}, signature: {}", .{ packet, payload, fmt.fmtSliceHexLower(&sig.toBytes()) });
+        // TODO: make this mandatory after the handshake
+        if (flags & Packet.Flag.signed != 0) {
+            const sig = try self.context.server_kp.sign(out.buf[0..self.end], null); // TODO: add noise
+            log.debug("Packet: {x}, payload: {x}, signature: {}", .{ packet, payload, fmt.fmtSliceHexLower(&sig.toBytes()) });
+            try out.writer().writeAll(&sig.toBytes());
+        } else {
+            log.debug("not signing packet", .{});
+        }
 
         try out.flush();
         self.end = 0;
@@ -512,6 +525,91 @@ const ClientWriter = struct {
     }
 };
 
+const ClientReader = struct {
+    const Self = @This();
+    const log = std.log.scoped(.client_reader);
+
+    pub const Error = error{
+        PacketTooBig,
+    };
+
+    pub const Reader = std.io.Reader(*Self, anyerror, read);
+
+    buffer: [Packet.max_len]u8 = undefined,
+    start: usize = 0,
+    end: usize = 0,
+
+    context: struct {
+        socket: posix.socket_t,
+        peer_id: ID = undefined,
+    },
+
+    pub fn read(self: *Self, dest: []u8) !usize {
+        var dest_index: usize = 0;
+
+        while (dest_index < dest.len) {
+            const written = @min(dest.len - dest_index, self.end - self.start);
+
+            @memcpy(dest[dest_index..][0..written], self.buffer[self.start..][0..written]);
+            if (written == 0) {
+                // buffer empty, read a *whole* packet in buffer
+                const stream = net.Stream{ .handle = self.context.socket };
+                var in = stream.reader();
+
+                // read packet (TODO: do this in a structured way..)
+                _ = try in.read(self.buffer[0..Packet.size]);
+
+                const len = std.mem.readInt(u32, self.buffer[0..4], .little);
+                log.debug("parsed len: {}", .{len});
+
+                const flags = std.mem.readInt(u8, self.buffer[4..5], .little);
+
+                // read payload
+                const n = try in.read(self.buffer[Packet.size .. Packet.size + len]); // read the payload
+
+                log.debug("read {} bytes ({x})", .{ n, self.buffer[Packet.size .. Packet.size + len] });
+                if (n == 0) {
+                    // reading from the unbuffered stream returned nothing
+                    // so we have nothing left to read.
+                    return dest_index;
+                }
+
+                // TODO: encryption flag
+
+                if (flags & Packet.Flag.signed != 0) {
+                    var bytes: [Ed25519.Signature.encoded_length]u8 = undefined;
+                    if (try in.read(&bytes) != bytes.len) {
+                        return error.SignatureInvalid;
+                    }
+
+                    log.debug("verifying signature {}", .{fmt.fmtSliceHexLower(&bytes)});
+
+                    const sig = Ed25519.Signature.fromBytes(bytes);
+                    const pub_key = try Ed25519.PublicKey.fromBytes(self.context.peer_id.public_key);
+
+                    sig.verify(self.buffer[0 .. Packet.size + n], pub_key) catch {
+                        log.warn("signature {} invalid for {}", .{ fmt.fmtSliceHexLower(&bytes), fmt.fmtSliceHexLower(&self.context.peer_id.public_key) });
+                        return error.SignatureInvalid;
+                    };
+
+                    log.debug("signature match!", .{});
+                }
+
+                self.start = 0;
+                self.end = Packet.size + n;
+            }
+            self.start += written;
+            dest_index += written;
+        }
+
+        return dest.len;
+    }
+
+    pub fn reader(self: *Self) Reader {
+        return .{ .context = self };
+    }
+};
+
 pub const Packet = struct {
     const log = std.log.scoped(.packet);
     const max_len = 1024;
@@ -528,6 +626,12 @@ pub const Packet = struct {
         hello,
         find_nodes,
         route,
+    };
+
+    const Flag = struct {
+        const none: u8 = 0x0;
+        const signed: u8 = 0x1;
+        const encrypted: u8 = 0x2;
     };
 
     len: u32,
@@ -547,7 +651,7 @@ pub const Packet = struct {
         log.debug("wrote packet: {}", .{p});
     }
 
-    pub fn read(reader: Client.Reader) !Packet {
+    pub fn read(reader: anytype) !Packet {
         log.debug("trying to read packet..", .{});
         const len = try reader.readInt(u32, .little);
         if (len > Packet.max_len) {
