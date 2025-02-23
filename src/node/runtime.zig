@@ -35,7 +35,7 @@ pub const ID = struct {
 
     fn write(self: ID, writer: Connection.Writer) !void {
         try writer.writeAll(&self.public_key);
-        try writer.writeByte(@intCast(self.address.any.family));
+        try writer.writeInt(u8, @intCast(self.address.any.family), .little);
         switch (self.address.any.family) {
             posix.AF.INET => {
                 try writer.writeInt(u32, self.address.in.sa.addr, .little);
@@ -50,7 +50,7 @@ pub const ID = struct {
         var id: ID = undefined;
         id.public_key = try reader.readBytesNoEof(32);
 
-        switch (try reader.readByte()) {
+        switch (try reader.readInt(u8, .little)) {
             posix.AF.INET => {
                 const addr = net.Ip4Address{ .sa = .{ .addr = try reader.readInt(u32, .little), .port = try reader.readInt(u16, .little) } };
 
@@ -61,6 +61,13 @@ pub const ID = struct {
         }
 
         return id;
+    }
+
+    fn eql(self: ID, other: ID) bool {
+        if (!std.mem.eql(u8, &self.public_key, &other.public_key))
+            return false;
+
+        return self.address.eql(other.address);
     }
 };
 
@@ -224,7 +231,7 @@ pub const Node = struct {
             .command => {
                 switch (packet.tag) {
                     .route => {
-                        const route = try Router.readRoute(self.allocator, client.reader(), @intCast(client.conn.read_end)); // TODO: remove hacky read_end
+                        const route = try Router.readRoute(self.allocator, client.reader());
 
                         if (std.mem.eql(u8, &self.id.public_key, &route.dst)) {
                             log.debug("ack route from {}", .{fmt.fmtSliceHexLower(&route.src)});
@@ -235,45 +242,13 @@ pub const Node = struct {
                             return;
                         }
 
-                        const peer_id = pid: {
-                            if (self.routing_table.get(route.dst)) |peer_id| {
-                                break :pid peer_id;
-                            } else {
-                                var peer_ids: [16]ID = undefined;
-                                const n = self.routing_table.closestTo(&peer_ids, route.dst);
-                                if (n == 0) {
-                                    log.warn("could not route to {}", .{fmt.fmtSliceHexLower(&route.dst)});
-                                    return;
-                                }
-                                break :pid peer_ids[0]; // TODO: pick random peer
-                            }
-                        };
+                        const peer_id = try Router.nextHop(self, route.dst, route.hops);
 
                         log.debug("fwd route to {}", .{peer_id});
 
-                        const c = try self.getOrCreateClient(peer_id.address);
+                        const next_hop = try self.getOrCreateClient(peer_id.address);
 
-                        try (Packet{
-                            .op = .command,
-                            .tag = .route,
-                        }).write(c.writer());
-
-                        try c.writer().writeAll(&route.src);
-                        try c.writer().writeAll(&route.dst);
-
-                        try c.writer().writeInt(u8, @intCast(route.hops.len + 1), .little);
-                        for (route.hops) |hop| {
-                            try hop.write(c.writer());
-                        }
-
-                        try self.id.write(c.writer());
-
-                        // Just passing it along! Nothing to do here :)
-                        try route.ph.write(c.writer());
-                        try route.eh.write(c.writer());
-                        try c.writer().writeAll(route.body);
-
-                        try c.write();
+                        try Router.forwardRoute(self, route.hops, route.src, route.dst, route.ph, route.eh, route.body, next_hop);
                     },
                     else => return error.UnexpectedTag,
                 }
@@ -692,7 +667,7 @@ pub const Router = struct {
         };
     }
 
-    pub fn readRoute(allocator: std.mem.Allocator, r: Connection.Reader, size: u32) !struct {
+    pub fn readRoute(allocator: std.mem.Allocator, r: Connection.Reader) !struct {
         hops: []ID,
         src: [32]u8,
         dst: [32]u8,
@@ -700,40 +675,97 @@ pub const Router = struct {
         eh: Packet.EncryptionHeader,
         body: []u8,
     } {
-        _ = size; // autofix
-        var in = std.io.countingReader(r);
-        const src = try in.reader().readBytesNoEof(32);
-        const dst = try in.reader().readBytesNoEof(32);
-        const count = try in.reader().readInt(u8, .little);
+        const src = try r.readBytesNoEof(32);
+        const dst = try r.readBytesNoEof(32);
+        const count = try r.readInt(u8, .little);
         if (count > 16) {
             return error.TooManyHops;
         }
 
-        var hops: [16]ID = undefined;
+        var hops = try allocator.alloc(ID, count);
         for (0..count) |i| {
-            hops[i] = try ID.read(in.reader());
+            hops[i] = try ID.read(r);
         }
 
-        log.debug("{} => {} (hops: {any})", .{ fmt.fmtSliceHexLower(&src), fmt.fmtSliceHexLower(&dst), hops[0..count] });
-        // const body = try allocator.alloc(u8, size - in.bytes_read + Packet.Header.size + Packet.EncryptionHeader.size); // minus IV len + sig len (because it's encrypted.. yikes >.<)
-        // log.debug("want to read {} bytes", .{body.len});
-        // _ = try in.reader().readAll(body);
-        // log.debug("body: {x}", .{body});
+        log.debug("{} => {} ({} hops: {any})", .{ fmt.fmtSliceHexLower(&src), fmt.fmtSliceHexLower(&dst), count, hops[0..count] });
 
-        const ph = try Packet.Header.read(in.reader());
-        const eh = try Packet.EncryptionHeader.read(in.reader());
+        const ph = try Packet.Header.read(r);
+        const eh = try Packet.EncryptionHeader.read(r);
         log.debug("ph: {}, eh: {}", .{ ph, eh });
         const body = try allocator.alloc(u8, ph.len);
-        _ = try in.reader().readAll(body);
+        _ = try r.readAll(body);
 
         return .{
-            .hops = hops[0..count],
+            .hops = hops,
             .src = src,
             .dst = dst,
             .ph = ph,
             .eh = eh,
             .body = body,
         };
+    }
+
+    fn forwardRoute(
+        node: *Node,
+        hops: []ID,
+        src: [32]u8,
+        dst: [32]u8,
+        ph: Packet.Header,
+        eh: Packet.EncryptionHeader,
+        body: []u8,
+        client: *Client,
+    ) !void {
+        try (Packet{
+            .op = .command,
+            .tag = .route,
+        }).write(client.writer());
+
+        try client.writer().writeAll(&src);
+        try client.writer().writeAll(&dst);
+
+        try client.writer().writeInt(u8, @intCast(hops.len + 1), .little);
+        for (hops) |hop| {
+            try hop.write(client.writer());
+        }
+
+        try node.id.write(client.writer());
+
+        // Just passing it along! Nothing to do here :)
+        try ph.write(client.writer());
+        try eh.write(client.writer());
+        try client.writer().writeAll(body);
+
+        try client.write();
+    }
+
+    fn nextHop(node: *Node, dst: [32]u8, used_hops: []ID) !ID {
+        if (node.routing_table.get(dst)) |peer_id| {
+            return peer_id;
+        } else {
+            var peer_ids: [16]ID = undefined;
+            const n = node.routing_table.closestTo(&peer_ids, dst);
+            if (n == 0) {
+                log.warn("could not route to {}", .{fmt.fmtSliceHexLower(&dst)});
+                return error.CouldNotRoute;
+            }
+
+            // find closest peer that is not used yet
+            for (peer_ids[0..n]) |peer_id| {
+                var is_new = true;
+                for (used_hops) |used_hop| {
+                    if (peer_id.eql(used_hop)) {
+                        is_new = false;
+                        break;
+                    }
+                }
+
+                if (is_new) {
+                    return peer_id;
+                }
+            }
+
+            return error.CouldNotRoute;
+        }
     }
 
     pub fn decrypt(allocator: std.mem.Allocator, node: *Node, src: [32]u8, ph: Packet.Header, eh: Packet.EncryptionHeader, cipher_text: []u8) ![]u8 {
@@ -789,6 +821,7 @@ pub const Router = struct {
         // TODO: siggy!
     }
 };
+
 pub const Packet = struct {
     const log = std.log.scoped(.packet);
     const max_len = 1024;
