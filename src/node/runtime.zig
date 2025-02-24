@@ -261,7 +261,7 @@ pub const Node = struct {
         posix.close(self.listener);
         var client_it = self.clients.valueIterator();
         while (client_it.next()) |client_ptr| {
-            log.info("shutting down client {}...", .{client_ptr.*.conn.socket});
+            log.info("shutting down client {}...", .{client_ptr.*.socket});
             self.closeClient(client_ptr.*);
         }
     }
@@ -274,10 +274,10 @@ pub const Node = struct {
                 log.debug("closing client {}", .{peer_id});
             }
         } else {
-            log.debug("closing client {}", .{client.conn.socket});
+            log.debug("closing client {}", .{client.socket});
         }
 
-        posix.close(client.conn.socket);
+        posix.close(client.socket);
         client.deinit(self.allocator);
         self.client_pool.destroy(client);
     }
@@ -293,7 +293,7 @@ pub const Node = struct {
         const client = try self.createClient(socket, address);
         try self.loop.newClient(client);
 
-        log.info("Accepted client: {}", .{client.conn.socket});
+        log.info("Accepted client: {}", .{client.socket});
     }
 
     fn createClient(self: *Node, socket: posix.socket_t, address: net.Address) !*Client {
@@ -384,6 +384,7 @@ const Client = struct {
     loop: *KQueue,
     address: net.Address,
 
+    socket: posix.socket_t,
     conn: Connection,
 
     keys: X25519.KeyPair,
@@ -396,15 +397,17 @@ const Client = struct {
         server_kp: *Ed25519.KeyPair,
     ) !Client {
         _ = allocator; // autofix
-
         const keys = try X25519.KeyPair.create(null); // generate new KP for each client (used for e2e)
 
         return .{
             .loop = loop,
             .address = address,
             .keys = keys,
+            .socket = socket,
             .conn = .{
-                .socket = socket,
+                .backing = .{
+                    .socket = socket,
+                },
                 .server_kp = server_kp,
             },
         };
@@ -451,6 +454,11 @@ pub const Connection = struct {
     pub const Writer = std.io.Writer(*Self, Error, write);
     pub const Reader = std.io.Reader(*Self, anyerror, read);
 
+    backing: union(enum) {
+        socket: posix.socket_t,
+        buffer: []u8,
+    },
+
     write_buffer: [Packet.max_len]u8 = undefined,
     write_end: usize = 0,
 
@@ -462,7 +470,7 @@ pub const Connection = struct {
 
     peer_id: ?ID = null,
     session: ?e2e.Session = null,
-    socket: posix.socket_t,
+
     server_kp: *Ed25519.KeyPair,
 
     fn read(self: *Self, dest: []u8) !usize {
@@ -473,9 +481,20 @@ pub const Connection = struct {
 
             @memcpy(dest[dest_index..][0..written], self.read_buffer[self.read_start..][0..written]);
             if (written == 0) {
+                var in = stream: {
+                    switch (self.backing) {
+                        .socket => |handle| {
+                            const network_stream = net.Stream{ .handle = handle };
+                            break :stream network_stream.reader().any();
+                        },
+                        .buffer => |buffer| {
+                            var inmemory_stream = std.io.fixedBufferStream(buffer);
+                            break :stream inmemory_stream.reader().any();
+                        },
+                    }
+                };
+
                 // buffer empty, read a *whole* packet in buffer
-                const stream = net.Stream{ .handle = self.socket };
-                var in = stream.reader();
                 const header = try Packet.Header.read(in);
                 var encryption_header: ?Packet.EncryptionHeader = null;
 
@@ -576,8 +595,21 @@ pub const Connection = struct {
             .flags = self.flags,
         };
 
-        const stream = net.Stream{ .handle = self.socket };
-        var out = std.io.bufferedWriter(stream.writer());
+        const underlying_stream = stream: {
+            switch (self.backing) {
+                .socket => |handle| {
+                    const stream = net.Stream{ .handle = handle };
+
+                    break :stream stream.writer().any();
+                },
+                .buffer => |buffer| {
+                    var inmemory_stream = std.io.fixedBufferStream(buffer);
+                    break :stream inmemory_stream.writer().any();
+                },
+            }
+        };
+
+        var out = std.io.bufferedWriter(underlying_stream);
 
         try header.write(out.writer());
         if (encryption_header) |h| {
@@ -994,7 +1026,7 @@ const KQueue = struct {
 
     fn newClient(self: *KQueue, client: *Client) !void {
         try self.queueChange(.{
-            .ident = @intCast(client.conn.socket),
+            .ident = @intCast(client.socket),
             .filter = posix.system.EVFILT_READ,
             .flags = posix.system.EV_ADD,
             .fflags = 0,
@@ -1003,7 +1035,7 @@ const KQueue = struct {
         });
 
         try self.queueChange(.{
-            .ident = @intCast(client.conn.socket),
+            .ident = @intCast(client.socket),
             .filter = posix.system.EVFILT_WRITE,
             .flags = posix.system.EV_ADD | posix.system.EV_DISABLE,
             .fflags = 0,
@@ -1014,7 +1046,7 @@ const KQueue = struct {
 
     fn readMode(self: *KQueue, client: *Client) !void {
         try self.queueChange(.{
-            .ident = @intCast(client.conn.socket),
+            .ident = @intCast(client.socket),
             .filter = posix.system.EVFILT_WRITE,
             .flags = posix.system.EV_DISABLE,
             .fflags = 0,
@@ -1023,7 +1055,7 @@ const KQueue = struct {
         });
 
         try self.queueChange(.{
-            .ident = @intCast(client.conn.socket),
+            .ident = @intCast(client.socket),
             .filter = posix.system.EVFILT_READ,
             .flags = posix.system.EV_ENABLE,
             .fflags = 0,
@@ -1034,7 +1066,7 @@ const KQueue = struct {
 
     fn writeMode(self: *KQueue, client: *Client) !void {
         try self.queueChange(.{
-            .ident = @intCast(client.conn.socket),
+            .ident = @intCast(client.socket),
             .filter = posix.system.EVFILT_READ,
             .flags = posix.system.EV_DISABLE,
             .fflags = 0,
@@ -1043,7 +1075,7 @@ const KQueue = struct {
         });
 
         try self.queueChange(.{
-            .ident = @intCast(client.conn.socket),
+            .ident = @intCast(client.socket),
             .filter = posix.system.EVFILT_WRITE,
             .flags = posix.system.EV_ENABLE,
             .fflags = 0,

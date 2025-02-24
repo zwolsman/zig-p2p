@@ -219,7 +219,7 @@ fn bootstrapNodeWithPeers(node: *runtime.Node) !void {
 
     for (0..count) |i| {
         var client = try node.getOrCreateClient(peer_ids[i].address);
-        try posix.setsockopt(client.conn.socket, posix.SOL.SOCKET, posix.SOCK.NONBLOCK, &std.mem.toBytes(@as(c_int, 0)));
+        try posix.setsockopt(client.socket, posix.SOL.SOCKET, posix.SOCK.NONBLOCK, &std.mem.toBytes(@as(c_int, 0)));
 
         log.debug("findings node by quering {?}", .{client.conn.peer_id});
         try (runtime.Packet{
@@ -257,7 +257,7 @@ fn bootstrapNodeWithPeers(node: *runtime.Node) !void {
             },
         }
 
-        try posix.setsockopt(client.conn.socket, posix.SOL.SOCKET, posix.SOCK.NONBLOCK, &std.mem.toBytes(@as(c_int, 1)));
+        try posix.setsockopt(client.socket, posix.SOL.SOCKET, posix.SOCK.NONBLOCK, &std.mem.toBytes(@as(c_int, 1)));
     }
 }
 
