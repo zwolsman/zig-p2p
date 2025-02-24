@@ -143,8 +143,9 @@ pub const Node = struct {
                                     break;
                                 };
 
-                                self.handleServerPacket(client, packet) catch |err| {
+                                self.handleServerPacket(client, client.reader(), packet) catch |err| {
                                     log.warn("could not handle packet: {}", .{err});
+                                    break;
                                 };
                             },
                             system.EVFILT_WRITE => {
@@ -164,16 +165,16 @@ pub const Node = struct {
         }
     }
 
-    fn handleServerPacket(self: *Node, client: *Client, packet: Packet) !void {
+    fn handleServerPacket(self: *Node, client: *Client, reader: anytype, packet: Packet) !void {
         switch (packet.op) {
             .request => {
                 switch (packet.tag) {
                     .hello => {
-                        const peer_id = try ID.read(client.reader());
-                        const pk = try client.reader().readBytesNoEof(32);
+                        const peer_id = try ID.read(reader);
+                        const pk = try reader.readBytesNoEof(32);
                         const sk = try crypto.dh.X25519.scalarmult(client.keys.secret_key, pk);
 
-                        const peer_sig = Ed25519.Signature.fromBytes(try client.reader().readBytesNoEof(Ed25519.Signature.encoded_length));
+                        const peer_sig = Ed25519.Signature.fromBytes(try reader.readBytesNoEof(Ed25519.Signature.encoded_length));
                         try peer_sig.verify(client.conn.read_buffer[0 .. client.conn.read_end - Ed25519.Signature.encoded_length], try Ed25519.PublicKey.fromBytes(peer_id.public_key));
 
                         log.debug("{} signature matches from {}", .{ packet.tag, peer_id });
@@ -202,7 +203,7 @@ pub const Node = struct {
                         try client.conn.enableEncryptionWithRemoteKey(sk, pk);
                     },
                     .find_nodes => {
-                        const public_key = try client.reader().readBytesNoEof(32);
+                        const public_key = try reader.readBytesNoEof(32);
                         var peer_ids: [16]ID = undefined;
                         const count = self.routing_table.closestTo(&peer_ids, public_key);
                         log.debug("found {} clients for {}", .{ count, fmt.fmtSliceHexLower(&public_key) });
@@ -231,24 +232,51 @@ pub const Node = struct {
             .command => {
                 switch (packet.tag) {
                     .route => {
-                        const route = try Router.readRoute(self.allocator, client.reader());
+                        const route = try Router.readRoute(self.allocator, reader);
 
                         if (std.mem.eql(u8, &self.id.public_key, &route.dst)) {
                             log.debug("ack route from {}", .{fmt.fmtSliceHexLower(&route.src)});
-                            log.debug("having to decrypt body: {x}", .{route.body});
 
-                            const result = try Router.decrypt(self.allocator, self, route.src, route.ph, route.eh, route.body);
-                            log.debug("decrypted: {s} ({x})", .{ result, result });
-                            return;
+                            var source_connection = Connection{
+                                .server_kp = &self.keys,
+                                .session = try Router.getOrCreateSession(self.allocator, self, route.src),
+                                .backing = .{
+                                    .connection = &client.conn,
+                                },
+                            };
+
+                            const routed_packet = try Packet.read(source_connection.reader());
+                            return self.handleServerPacket(client, source_connection.reader(), routed_packet);
                         }
 
                         const peer_id = try Router.nextHop(self, route.dst, route.hops);
-
                         log.debug("fwd route to {}", .{peer_id});
 
                         const next_hop = try self.getOrCreateClient(peer_id.address);
+                        try (Packet{
+                            .op = .command,
+                            .tag = .route,
+                        }).write(next_hop.writer());
 
-                        try Router.forwardRoute(self, route.hops, route.src, route.dst, route.ph, route.eh, route.body, next_hop);
+                        try next_hop.writer().writeAll(&route.src);
+                        try next_hop.writer().writeAll(&route.dst);
+
+                        try next_hop.writer().writeInt(u8, @intCast(route.hops.len + 1), .little);
+                        for (route.hops) |hop| {
+                            try hop.write(next_hop.writer());
+                        }
+
+                        try self.id.write(next_hop.writer());
+
+                        // Just passing it along! Nothing to do here :)
+                        try next_hop.writer().writeAll(client.conn.drainReadBuffer());
+                        try next_hop.write();
+                    },
+                    .echo => {
+                        const len = try reader.readInt(u8, .little);
+                        const txt = try self.allocator.alloc(u8, len);
+                        _ = try reader.read(txt);
+                        log.info("echo: {s}", .{txt});
                     },
                     else => return error.UnexpectedTag,
                 }
@@ -422,7 +450,7 @@ const Client = struct {
     }
 
     pub fn write(self: *Client) !void {
-        try self.conn.flush();
+        _ = try self.conn.flush();
     }
 
     fn assignPeerID(self: *Client, peer_id: ID) void {
@@ -446,9 +474,9 @@ pub const Connection = struct {
         PacketTooBig,
     };
     pub const Flag = struct {
-        const none: u8 = 0x0;
-        const signed: u8 = 0x1;
-        const encrypted: u8 = 0x2;
+        pub const none: u8 = 0x0;
+        pub const signed: u8 = 0x1;
+        pub const encrypted: u8 = 0x2;
     };
 
     pub const Writer = std.io.Writer(*Self, Error, write);
@@ -457,6 +485,7 @@ pub const Connection = struct {
     backing: union(enum) {
         socket: posix.socket_t,
         buffer: []u8,
+        connection: *Connection,
     },
 
     write_buffer: [Packet.max_len]u8 = undefined,
@@ -490,6 +519,9 @@ pub const Connection = struct {
                         .buffer => |buffer| {
                             var inmemory_stream = std.io.fixedBufferStream(buffer);
                             break :stream inmemory_stream.reader().any();
+                        },
+                        .connection => |conn| {
+                            break :stream conn.reader().any();
                         },
                     }
                 };
@@ -574,7 +606,7 @@ pub const Connection = struct {
         return bytes.len;
     }
 
-    fn flush(self: *Self) !void {
+    pub fn flush(self: *Self) !void {
         var data_to_write = self.write_buffer[0..self.write_end];
         var encryption_header: ?Packet.EncryptionHeader = null;
 
@@ -606,6 +638,9 @@ pub const Connection = struct {
                     var inmemory_stream = std.io.fixedBufferStream(buffer);
                     break :stream inmemory_stream.writer().any();
                 },
+                .connection => |conn| {
+                    break :stream conn.writer().any();
+                },
             }
         };
 
@@ -627,6 +662,14 @@ pub const Connection = struct {
         try out.flush();
 
         self.write_end = 0;
+    }
+
+    fn drainReadBuffer(self: *Self) []u8 {
+        const start = self.read_start;
+        const end = self.read_end;
+        self.read_start = self.read_end;
+
+        return self.read_buffer[start..end];
     }
 
     fn enableFlag(self: *Self, flag: u8) void {
@@ -703,9 +746,6 @@ pub const Router = struct {
         hops: []ID,
         src: [32]u8,
         dst: [32]u8,
-        ph: Packet.Header,
-        eh: Packet.EncryptionHeader,
-        body: []u8,
     } {
         const src = try r.readBytesNoEof(32);
         const dst = try r.readBytesNoEof(32);
@@ -721,53 +761,12 @@ pub const Router = struct {
 
         log.debug("{} => {} ({} hops: {any})", .{ fmt.fmtSliceHexLower(&src), fmt.fmtSliceHexLower(&dst), count, hops[0..count] });
 
-        const ph = try Packet.Header.read(r);
-        const eh = try Packet.EncryptionHeader.read(r);
-        log.debug("ph: {}, eh: {}", .{ ph, eh });
-        const body = try allocator.alloc(u8, ph.len);
-        _ = try r.readAll(body);
-
         return .{
             .hops = hops,
             .src = src,
             .dst = dst,
-            .ph = ph,
-            .eh = eh,
-            .body = body,
+            // .payload = payload,
         };
-    }
-
-    fn forwardRoute(
-        node: *Node,
-        hops: []ID,
-        src: [32]u8,
-        dst: [32]u8,
-        ph: Packet.Header,
-        eh: Packet.EncryptionHeader,
-        body: []u8,
-        client: *Client,
-    ) !void {
-        try (Packet{
-            .op = .command,
-            .tag = .route,
-        }).write(client.writer());
-
-        try client.writer().writeAll(&src);
-        try client.writer().writeAll(&dst);
-
-        try client.writer().writeInt(u8, @intCast(hops.len + 1), .little);
-        for (hops) |hop| {
-            try hop.write(client.writer());
-        }
-
-        try node.id.write(client.writer());
-
-        // Just passing it along! Nothing to do here :)
-        try ph.write(client.writer());
-        try eh.write(client.writer());
-        try client.writer().writeAll(body);
-
-        try client.write();
     }
 
     fn nextHop(node: *Node, dst: [32]u8, used_hops: []ID) !ID {
@@ -800,23 +799,21 @@ pub const Router = struct {
         }
     }
 
-    pub fn decrypt(allocator: std.mem.Allocator, node: *Node, src: [32]u8, ph: Packet.Header, eh: Packet.EncryptionHeader, cipher_text: []u8) ![]u8 {
-        _ = ph; // autofix
+    fn getOrCreateSession(allocator: std.mem.Allocator, node: *Node, src: [32]u8) !e2e.Session {
         const keys = try X25519.KeyPair.fromEd25519(node.keys);
         const src_pub = try X25519.publicKeyFromEd25519(try Ed25519.PublicKey.fromBytes(src));
         const sk = try X25519.scalarmult(keys.secret_key, src_pub);
         log.debug("route sk: {}", .{fmt.fmtSliceHexLower(&sk)});
 
-        var session = e2e.init(allocator, "test-2", sk, keys);
+        return e2e.init(allocator, "test-2", sk, keys);
+    }
 
-        const plain_text = try session.decrypt(.{
-            .dh = eh.dh,
-            .n = eh.n,
-            .pn = eh.pn,
-            .cipher_text = cipher_text,
-        });
+    pub fn getOrCreateRemoteSession(allocator: std.mem.Allocator, node: *Node, dst: [32]u8) !e2e.Session {
+        const dst_pub = try X25519.publicKeyFromEd25519(try Ed25519.PublicKey.fromBytes(dst));
+        const keys = try X25519.KeyPair.fromEd25519(node.keys);
 
-        return plain_text;
+        const sk = try X25519.scalarmult(keys.secret_key, dst_pub);
+        return try e2e.initRemoteKey(allocator, "test", sk, dst_pub);
     }
 
     pub fn writer(self: *Router) Buffer.Writer {

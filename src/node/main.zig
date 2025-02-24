@@ -96,23 +96,37 @@ fn openTty(n: *runtime.Node) void {
                         continue;
                     };
 
-                    var route = runtime.Router.createRoute(alloc, node, public_key) catch |err| {
-                        log.err("could not create route: {}", .{err});
-                        continue;
-                    };
+                    (runtime.Packet{
+                        .op = .command,
+                        .tag = .route,
+                    }).write(client.writer()) catch continue;
 
-                    var w = route.writer();
+                    client.writer().writeAll(&node.id.public_key) catch continue;
+                    client.writer().writeAll(&public_key) catch continue;
+
+                    // amount of hops
+                    client.writer().writeInt(u8, 0, .little) catch continue;
+
+                    // const buffer = client.conn.write_buffer[client.conn.write_end..];
+                    var dest_connection = runtime.Connection{
+                        .backing = .{
+                            .connection = &client.conn,
+                        },
+                        .session = runtime.Router.getOrCreateRemoteSession(node.allocator, node, public_key) catch null,
+                        .flags = runtime.Connection.Flag.encrypted,
+                        .server_kp = &node.keys,
+                    };
 
                     //Start route packet
                     (runtime.Packet{
                         .op = .command,
                         .tag = .echo,
-                    }).write(w) catch continue;
+                    }).write(dest_connection.writer()) catch continue;
 
                     const msg = "testing 123";
-                    w.writeInt(u8, msg.len, .little) catch continue;
-                    w.writeAll(msg) catch continue;
-                    route.write(client.conn.writer()) catch continue;
+                    dest_connection.writer().writeInt(u8, msg.len, .little) catch continue;
+                    dest_connection.writer().writeAll(msg) catch continue;
+                    dest_connection.flush() catch continue;
 
                     client.write() catch continue;
 
