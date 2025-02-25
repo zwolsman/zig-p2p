@@ -3,11 +3,69 @@ const net = std.net;
 const meta = std.meta;
 const mem = std.mem;
 const math = std.math;
+const posix = std.posix;
+const fmt = std.fmt;
 
 const assert = std.debug.assert;
 
-const ID = @import("runtime.zig").ID;
-const AddressContext = @import("runtime.zig").AddressContext;
+const AddressContext = @import("stdx.zig").AddressContext;
+
+pub const ID = struct {
+    public_key: [32]u8,
+    address: net.Address,
+
+    // pub key + type + ip + port
+    fn size(self: ID) u32 {
+        return @sizeOf([32]u8) + @sizeOf(u8) + @as(u32, switch (self.address.any.family) {
+            posix.AF.INET => @sizeOf([4]u8),
+            posix.AF.INET6 => @sizeOf([16]u8) + @sizeOf(u32),
+            else => unreachable,
+        }) + @sizeOf(u16);
+    }
+
+    pub fn format(self: ID, comptime layout: []const u8, options: fmt.FormatOptions, writer: anytype) !void {
+        _ = layout;
+        _ = options;
+        try fmt.format(writer, "{}[{}]", .{ self.address, fmt.fmtSliceHexLower(&self.public_key) });
+    }
+
+    pub fn write(self: ID, writer: anytype) !void {
+        try writer.writeAll(&self.public_key);
+        try writer.writeInt(u8, @intCast(self.address.any.family), .little);
+        switch (self.address.any.family) {
+            posix.AF.INET => {
+                try writer.writeInt(u32, self.address.in.sa.addr, .little);
+                try writer.writeInt(u16, self.address.in.sa.port, .little);
+            },
+            posix.AF.INET6 => return error.UnsupportedAddress, // TODO
+            else => unreachable,
+        }
+    }
+
+    pub fn read(reader: anytype) !ID {
+        var id: ID = undefined;
+        id.public_key = try reader.readBytesNoEof(32);
+
+        switch (try reader.readInt(u8, .little)) {
+            posix.AF.INET => {
+                const addr = net.Ip4Address{ .sa = .{ .addr = try reader.readInt(u32, .little), .port = try reader.readInt(u16, .little) } };
+
+                id.address = .{ .in = addr };
+            },
+            posix.AF.INET6 => return error.UnsupportedAddress, // TODO
+            else => unreachable,
+        }
+
+        return id;
+    }
+
+    pub fn eql(self: ID, other: ID) bool {
+        if (!std.mem.eql(u8, &self.public_key, &other.public_key))
+            return false;
+
+        return self.address.eql(other.address);
+    }
+};
 
 pub const RoutingTable = struct {
     pub const bucket_size = 16;

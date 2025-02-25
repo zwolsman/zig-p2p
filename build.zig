@@ -36,6 +36,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // get the "zig-aio" dependency from "build.zig.zon"
+    const zig_aio = b.dependency("zig-aio", .{});
+    // for exe, lib, tests, etc.
+    node.root_module.addImport("aio", zig_aio.module("aio"));
+    // for coroutines api
+    node.root_module.addImport("coro", zig_aio.module("coro"));
+
     const flags = b.dependency("flags", .{ .target = target, .optimize = optimize });
     node.root_module.addImport("flags", flags.module("flags"));
 

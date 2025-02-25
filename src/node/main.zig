@@ -1,295 +1,700 @@
 const std = @import("std");
 const net = std.net;
 const posix = std.posix;
-const system = std.posix.system;
-
 const fmt = std.fmt;
-const mem = std.mem;
+
+const stdx = @import("stdx.zig");
+const aio = @import("aio");
+const coro = @import("coro");
+
+const frames = @import("./network/frame.zig");
+const Packet = @import("./network/packet.zig").Packet;
+const PacketHeader = @import("./network//packet.zig").PacketHeader;
+
+const Ed25519 = std.crypto.sign.Ed25519;
+const X25519 = std.crypto.dh.X25519;
+const Kademlia = @import("kademlia.zig");
+const ID = Kademlia.ID;
 
 const flags = @import("flags");
 const CliFlags = @import("cliflags.zig");
-const kademlia = @import("kademlia.zig");
 
-const Allocator = std.mem.Allocator;
-const Ed25519 = std.crypto.sign.Ed25519;
+pub const std_options: std.Options = .{
+    .log_level = .debug,
+};
 
-var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-var alloc = gpa.allocator();
-
-const runtime = @import("runtime.zig");
+var scheduler: coro.Scheduler = undefined;
 
 pub fn main() !void {
     const log = std.log.scoped(.main);
-    var args = try std.process.argsWithAllocator(alloc);
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    defer _ = gpa.deinit();
+
+    const allocator = gpa.allocator();
+
+    scheduler = try coro.Scheduler.init(allocator, .{});
+    defer scheduler.deinit();
+
+    var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
 
-    var bootstrap_addresses = std.ArrayList([]const u8).init(gpa.allocator());
+    var bootstrap_addresses = std.ArrayList([]const u8).init(allocator);
     defer bootstrap_addresses.deinit();
 
     const options = flags.parseOrExit(&args, "node", CliFlags, .{ .trailing_list = &bootstrap_addresses });
+    const listen_address = try stdx.parseIpAddress(options.listen_address);
 
     const keys = try Ed25519.KeyPair.create(null);
-    const listen_address = try parseIpAddress(options.listen_address);
-
-    var node: runtime.Node = try runtime.Node.init(alloc, keys, listen_address);
-
     log.debug("public key: {}", .{fmt.fmtSliceHexLower(&keys.public_key.bytes)});
     log.debug("secret key: {}", .{fmt.fmtSliceHexLower(keys.secret_key.bytes[0..32])});
 
-    try node.listen(listen_address);
-    defer node.deinit();
+    var node: Node = undefined;
+    try node.init(allocator, keys, listen_address);
+    try node.bind();
+
+    _ = try scheduler.spawn(Node.runAcceptLoop, .{ &node, allocator }, .{});
+
+    if (options.interactive) {
+        // var tpool = try coro.ThreadPool.init(allocator, .{});
+        // defer tpool.deinit();
+
+        // _ = try scheduler.spawn(openTTY, .{ &node, allocator }, .{ .detached = true });
+
+        var th = try std.Thread.spawn(.{}, openTTY, .{ &node, allocator });
+        th.detach();
+    }
+
+    var bootstrap_tasks = std.ArrayList(coro.Task).init(gpa.allocator());
+    defer bootstrap_tasks.deinit();
 
     for (bootstrap_addresses.items) |bootstrap_address| {
-        const address = try parseIpAddress(bootstrap_address);
-        const client = try node.getOrCreateClient(address);
-        log.info("connected to bootstrap node: {}", .{client.address});
+        const address = stdx.parseIpAddress(bootstrap_address) catch |err| {
+            log.warn("could not parse boostrap address {s}: {}", .{ bootstrap_address, err });
+            continue;
+        };
+
+        const client = node.getOrCreateClient(gpa.allocator(), address) catch |err| {
+            log.warn("could not connect to bootstrap node {}: {}", .{ address, err });
+            continue;
+        };
+        _ = client; // autofix
+
+        // TODO: wait for boostrap to be done and log how many connections are setup
+        // _ = try scheduler.spawn(bootstrapNodeWithPeer, .{ gpa.allocator(), &node, client }, .{});
     }
 
-    try bootstrapNodeWithPeers(&node);
-
-    if (options.interactive)
-        openTty(&node);
-
-    log.info("node is running", .{});
-    try node.run();
+    try scheduler.run(.wait);
 }
 
-fn openTty(n: *runtime.Node) void {
-    const run = struct {
-        const log = std.log.scoped(.tty);
+fn bootstrapNodeWithPeer(allocator: std.mem.Allocator, node: *Node, client: *Client) !void {
+    const log = std.log.scoped(.main);
+    log.debug("boostrapping with node {}", .{client.peer_id});
 
-        fn run(node: *runtime.Node) void {
-            log.info("Opening interactive tty\n", .{});
-            defer log.info("Closing interactive tty\n", .{});
+    try client.aquireReader();
+    defer client.releaseReader();
 
-            const r = std.io.getStdIn().reader();
-            var buf: [1024]u8 = undefined;
-            while (r.readUntilDelimiterOrEof(&buf, '\n') catch return) |txt| {
-                if (std.mem.eql(u8, txt, "info")) {
-                    std.debug.print("total peers connected to: {}\n", .{node.routing_table.len});
-                }
+    try (Packet{
+        .op = .request,
+        .tag = .find_nodes,
+    }).write(client.writer());
 
-                if (std.mem.startsWith(u8, txt, "route")) {
-                    var public_key: [32]u8 = undefined;
-                    _ = fmt.hexToBytes(&public_key, txt[6..70]) catch |err| {
-                        log.warn("could convert to public key; {}", .{err});
-                        continue;
-                    };
+    (frames.FindNodeFrame.Request{
+        .public_key = node.id.public_key,
+    }).write(client.writer());
 
-                    std.debug.print("routing to {}\n", .{fmt.fmtSliceHexLower(&public_key)});
-                    const peer_id = pid: {
-                        if (node.routing_table.get(public_key)) |peer_id| {
-                            break :pid peer_id;
-                        }
+    try client.flush(allocator);
 
-                        var peer_ids: [16]runtime.ID = undefined;
-                        const count = node.routing_table.closestTo(&peer_ids, public_key);
-                        if (count == 0) {
-                            log.warn("could not route packet to {}", .{fmt.fmtSliceHexLower(&public_key)});
-                            continue;
-                        }
-                        break :pid peer_ids[0];
-                    };
+    const raw_frame = try Node.readFrame(client, allocator);
 
-                    const client = node.getOrCreateClient(peer_id.address) catch |err| {
-                        log.warn("couldn't create client ({}): {}", .{ peer_id, err });
-                        continue;
-                    };
+    var stream = std.io.fixedBufferStream(raw_frame);
+    const packet = try Packet.read(stream.reader());
+    if (packet.op != .response) return error.UnexpectedOp;
+    if (packet.tag != .find_nodes) return error.UnexpectedTag;
 
-                    (runtime.Packet{
-                        .op = .command,
-                        .tag = .route,
-                    }).write(client.writer()) catch continue;
+    const frame = try frames.FindNodeFrame.Response.read(stream.reader());
 
-                    client.writer().writeAll(&node.id.public_key) catch continue;
-                    client.writer().writeAll(&public_key) catch continue;
+    for (frame.peer_ids) |peer_id| {
+        _ = node.getOrCreateClient(allocator, peer_id.address) catch |err| {
+            log.warn("could not connect to peer {}: {}", .{ peer_id, err });
+            continue;
+        };
+    }
+}
 
-                    // amount of hops
-                    client.writer().writeInt(u8, 0, .little) catch continue;
+fn openTTY(node: *Node, allocator: std.mem.Allocator) !void {
+    const log = std.log.scoped(.main);
+    log.info("opening interactive tty..", .{});
+    defer log.info("closing interactive tty..", .{});
 
-                    // const buffer = client.conn.write_buffer[client.conn.write_end..];
-                    var dest_connection = runtime.Connection{
-                        .backing = .{
-                            .connection = &client.conn,
-                        },
-                        .session = runtime.Router.getOrCreateRemoteSession(node.allocator, node, public_key) catch null,
-                        .flags = runtime.Connection.Flag.encrypted,
-                        .server_kp = &node.keys,
-                    };
+    const buffer = try allocator.alloc(u8, 1024);
 
-                    //Start route packet
-                    (runtime.Packet{
-                        .op = .command,
-                        .tag = .echo,
-                    }).write(dest_connection.writer()) catch continue;
+    while (true) {
+        const command = std.io.getStdIn().reader().readUntilDelimiter(buffer, '\n') catch continue;
 
-                    const msg = "testing 123";
-                    dest_connection.writer().writeInt(u8, msg.len, .little) catch continue;
-                    dest_connection.writer().writeAll(msg) catch continue;
-                    dest_connection.flush() catch continue;
+        if (std.mem.eql(u8, "id", command)) {
+            std.debug.print("{}\n", .{node.id});
+        } else if (std.mem.startsWith(u8, command, "echo ")) {
+            const message = command["echo ".len..];
+            std.debug.print("{s}\n", .{message});
+        } else if (std.mem.startsWith(u8, command, "route ")) {
+            const route_data = command["route ".len..];
 
-                    client.write() catch continue;
+            const id_end = std.mem.indexOf(u8, route_data, " ") orelse route_data.len;
+            const id = route_data[0..id_end];
 
-                    std.debug.print("sent route cmd to {}\n", .{peer_id});
-                }
-
-                if (txt.len == 64) {
-                    std.debug.print("looking up: {s}\n", .{txt});
-
-                    var public_key: [32]u8 = undefined;
-                    _ = fmt.hexToBytes(&public_key, txt) catch |err| {
-                        log.warn("could convert to public key; {}", .{err});
-                        continue;
-                    };
-
-                    if (std.mem.eql(u8, &node.id.public_key, &public_key)) {
-                        std.debug.print("it's you!\n", .{});
-                        continue;
-                    }
-
-                    if (node.routing_table.get(public_key)) |peer_id| {
-                        std.debug.print("you're connected to it: {}\n", .{peer_id});
-                        continue;
-                    }
-
-                    var peer_ids: [16]runtime.ID = undefined;
-                    const node_count = node.routing_table.closestTo(&peer_ids, public_key);
-                    std.debug.print("closest: {any}\n", .{peer_ids[0..node_count]});
-                }
+            if (id.len != 64) {
+                std.debug.print("error: route data must be 32 bytes long\n", .{});
+                continue;
             }
+
+            var dest_key: [32]u8 = undefined;
+            _ = std.fmt.hexToBytes(&dest_key, id) catch |err| {
+                std.debug.print("error: route data must be a valid hex string: {}\n", .{err});
+                continue;
+            };
+
+            const msg = route_data[id_end..]; // TODO: trim
+            const next_hop_id = Routing.nextHop(node, node.id.public_key, dest_key, &[_]ID{}) orelse {
+                log.warn("could not route packet to {}", .{fmt.fmtSliceHexLower(&dest_key)});
+                continue;
+            };
+
+            const next_hop = try node.getOrCreateClient(allocator, next_hop_id.address);
+
+            try (Packet{
+                .op = .command,
+                .tag = .route,
+            }).write(next_hop.writer());
+
+            try (frames.RouteFrame{
+                .src = node.id.public_key,
+                .dst = dest_key,
+            }).write(next_hop.writer());
+
+            var dest_conn = Connection.init(allocator, .{ .connection = &next_hop.conn }, &node.keys);
+
+            try (Packet{
+                .op = .command,
+                .tag = .echo,
+            }).write(dest_conn.writer());
+
+            try (frames.EchoFrame{
+                .txt = msg,
+            }).write(dest_conn.writer());
+
+            try dest_conn.flush(allocator);
+            try next_hop.flush(allocator);
+            log.info("routed packet to {}", .{fmt.fmtSliceHexLower(&dest_key)});
         }
-    }.run;
-
-    const thread = std.Thread.spawn(.{}, run, .{n}) catch {
-        std.debug.print("Could not open interactive tty\n", .{});
-        return;
-    };
-
-    thread.detach();
+    }
 }
 
-fn parseIpAddress(address: []const u8) !net.Address {
-    const parsed = splitHostPort(address) catch |err| return switch (err) {
-        error.DelimiterNotFound => net.Address.parseIp("127.0.0.1", try fmt.parseUnsigned(u16, address, 10)),
-        else => err,
-    };
+const Node = struct {
+    const Self = @This();
+    const log = std.log.scoped(.node);
 
-    const parsed_host = parsed.host;
-    const parsed_port = try fmt.parseUnsigned(u16, parsed.port, 10);
-    if (parsed_host.len == 0) return net.Address.parseIp("0.0.0.0", parsed_port);
+    id: ID,
+    socket: std.posix.socket_t,
+    address: std.net.Address,
+    keys: Ed25519.KeyPair,
 
-    return net.Address.parseIp(parsed_host, parsed_port);
-}
+    table: Kademlia.RoutingTable,
 
-const HostPort = struct {
-    host: []const u8,
-    port: []const u8,
+    clients: std.HashMapUnmanaged(net.Address, *Client, stdx.AddressContext, std.hash_map.default_max_load_percentage),
+    client_pool: std.heap.MemoryPool(Client),
+
+    fn init(self: *Self, allocator: std.mem.Allocator, keys: Ed25519.KeyPair, address: std.net.Address) !void {
+        self.id = .{ .public_key = keys.public_key.toBytes(), .address = address };
+        self.keys = keys;
+        self.address = address;
+        self.clients = .{};
+        self.table = .{ .public_key = keys.public_key.toBytes() };
+
+        self.client_pool = std.heap.MemoryPool(Client).init(allocator);
+    }
+
+    fn bind(self: *Self) !void {
+        var socket: std.posix.socket_t = undefined;
+        try coro.io.single(.socket, .{
+            .domain = std.posix.AF.INET,
+            .flags = std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC,
+            .protocol = std.posix.IPPROTO.TCP,
+            .out_socket = &socket,
+        });
+
+        try std.posix.setsockopt(socket, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
+        if (@hasDecl(std.posix.SO, "REUSEPORT")) {
+            try std.posix.setsockopt(socket, std.posix.SOL.SOCKET, std.posix.SO.REUSEPORT, &std.mem.toBytes(@as(c_int, 1)));
+        }
+        try std.posix.bind(socket, &self.address.any, self.address.getOsSockLen());
+        try std.posix.listen(socket, 128);
+        var sock_address: std.net.Address = undefined;
+        var sock_address_len: std.posix.socklen_t = undefined;
+        try std.posix.getsockname(socket, &sock_address.any, &sock_address_len);
+
+        log.info("listening on {}", .{sock_address});
+
+        self.address = sock_address;
+        self.id.address = sock_address;
+        self.socket = socket;
+    }
+
+    fn runAcceptLoop(self: *Self, allocator: std.mem.Allocator) !void {
+        while (true) {
+            var client_socket: std.posix.socket_t = undefined;
+            var client_addr: std.net.Address = undefined;
+            var client_addrlen: posix.socklen_t = @sizeOf(std.net.Address);
+
+            try coro.io.single(.accept, .{ .socket = self.socket, .out_socket = &client_socket, .out_addr = &client_addr.any, .inout_addrlen = &client_addrlen });
+
+            const client: *Client = try self.client_pool.create();
+            errdefer self.client_pool.destroy(client);
+
+            client.* = Client.init(
+                allocator,
+                client_socket,
+                client_addr,
+                &self.keys,
+            ) catch |err| {
+                coro.io.single(.close_socket, .{ .socket = client_socket }) catch {};
+                log.err("failed to initialize client: {}", .{err});
+                return err;
+            };
+            errdefer client.deinit(allocator);
+
+            _ = try scheduler.spawn(Node.runReadLoop, .{ self, allocator, client }, .{});
+        }
+    }
+
+    fn runReadLoop(self: *Self, allocator: std.mem.Allocator, client: *Client) !void {
+        defer self.closeClient(allocator, client);
+
+        while (true) {
+            try client.can_read.wait();
+            const task = try scheduler.spawn(frames.readFrame, .{ client, allocator }, .{});
+            client.read_task = &task;
+
+            const frame = task.complete(.wait) catch |err| {
+                log.warn("could not read from {} ({}): {}", .{ client.socket, client.address, err });
+                break;
+            };
+
+            self.handleServerPacket(allocator, client, frame) catch |err| {
+                log.warn("could not handle server packet: {}", .{err});
+                continue;
+            };
+
+            allocator.free(frame);
+        }
+    }
+
+    fn handleServerPacket(self: *Node, allocator: std.mem.Allocator, client: *Client, raw_frame: []u8) !void {
+        var stream = std.io.fixedBufferStream(raw_frame);
+        const reader = stream.reader();
+        const packet = try Packet.read(reader);
+
+        switch (packet.op) {
+            .request => {
+                switch (packet.tag) {
+                    .hello => {
+                        const frame = try frames.HelloFrame.read(reader);
+                        const signer = try Ed25519.PublicKey.fromBytes(frame.peer_id.public_key);
+                        const signature = Ed25519.Signature.fromBytes(try reader.readBytesNoEof(64));
+
+                        // without the signature
+                        const msg = raw_frame[0 .. raw_frame.len - Ed25519.Signature.encoded_length];
+                        try signature.verify(msg, signer);
+
+                        switch (self.table.put(frame.peer_id)) {
+                            .full => log.info("incoming handshake from {} (peer ignored)", .{frame.peer_id}),
+                            .updated => log.info("incoming handshake from {} (peer updated)", .{frame.peer_id}),
+                            .inserted => log.info("incoming handshake from {} (peer registered)", .{frame.peer_id}),
+                        }
+
+                        var signing_writer = SigningWriter(Connection.Writer){
+                            .signer = try self.keys.signer(null),
+                            .underlying_stream = client.writer(),
+                        };
+
+                        try (Packet{
+                            .op = .response,
+                            .tag = .hello,
+                        }).write(signing_writer.writer());
+
+                        try (frames.HelloFrame{
+                            .peer_id = self.id,
+                            .public_key = client.keys.public_key,
+                        }).write(signing_writer.writer());
+
+                        try signing_writer.sign();
+
+                        try client.flush(allocator);
+
+                        try client.configurePeer(frame.peer_id, frame.public_key, .remoteKey);
+                    },
+                    .find_nodes => {
+                        const public_key = try reader.readBytesNoEof(32);
+                        var peer_ids: [16]ID = undefined;
+                        const n = self.table.closestTo(&peer_ids, public_key);
+
+                        try (Packet{
+                            .op = .response,
+                            .tag = .find_nodes,
+                        }).write(client.writer());
+
+                        try (frames.FindNodeFrame.Response{
+                            .peer_ids = peer_ids[0..n],
+                        }).write(client.writer());
+
+                        try client.flush(allocator);
+                    },
+                    else => return error.UnexpectedTag,
+                }
+            },
+            .command => {
+                switch (packet.tag) {
+                    .route => {
+                        var frame = try frames.RouteFrame.read(allocator, reader);
+                        log.debug("received routing frame: {}", .{frame});
+
+                        // well, it's received
+                        if (std.mem.eql(u8, &frame.dst, &self.id.public_key)) {
+                            const header = try PacketHeader.read(reader);
+                            const original_frame = try frames.processFrame(allocator, client, header, stream.buffer[stream.pos..]);
+                            return self.handleServerPacket(allocator, client, original_frame);
+                        }
+
+                        const peer_id = Routing.nextHop(self, frame.src, frame.dst, frame.hops) orelse {
+                            log.warn("could not forward route", .{});
+                            return;
+                        };
+
+                        const next_client = try self.getOrCreateClient(allocator, peer_id.address);
+
+                        var hops = std.ArrayList(ID).init(allocator);
+                        try hops.appendSlice(frame.hops);
+                        try hops.append(self.id);
+
+                        try (Packet{
+                            .op = .command,
+                            .tag = .route,
+                        }).write(next_client.writer());
+
+                        try (frames.RouteFrame{
+                            .src = frame.src,
+                            .dst = frame.dst,
+                            .hops = try hops.toOwnedSlice(),
+                        }).write(next_client.writer());
+                        try next_client.writer().writeAll(stream.buffer[stream.pos..]);
+
+                        stream.seekTo(stream.buffer.len) catch unreachable;
+
+                        try next_client.flush(allocator);
+                    },
+                    .echo => {
+                        const frame = try frames.EchoFrame.read(allocator, reader);
+
+                        std.debug.print("{s}\n", .{frame.txt});
+                    },
+                    else => return error.UnexpectedTag,
+                }
+            },
+            else => return error.UnexpectedOp,
+        }
+
+        std.debug.assert(stream.pos == stream.buffer.len);
+    }
+
+    fn getOrCreateClient(self: *Node, allocator: std.mem.Allocator, address: net.Address) !*Client {
+        const result = try self.clients.getOrPut(allocator, address);
+        if (!result.found_existing) {
+            errdefer std.debug.assert(self.clients.remove(address));
+            var socket: std.posix.socket_t = undefined;
+
+            try coro.io.single(.socket, .{
+                .domain = std.posix.AF.INET,
+                .flags = std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC,
+                .protocol = std.posix.IPPROTO.TCP,
+                .out_socket = &socket,
+            });
+
+            try coro.io.single(.connect, .{
+                .socket = socket,
+                .addr = &address.any,
+                .addrlen = address.getOsSockLen(),
+            });
+
+            const client: *Client = try self.client_pool.create();
+            errdefer self.client_pool.destroy(client);
+
+            client.* = try Client.init(
+                allocator,
+                socket,
+                address,
+                &self.keys,
+            );
+            result.value_ptr.* = client;
+
+            var signing_writer = SigningWriter(Connection.Writer){
+                .signer = try self.keys.signer(null),
+                .underlying_stream = result.value_ptr.*.writer(),
+            };
+
+            try (Packet{
+                .op = .request,
+                .tag = .hello,
+            }).write(signing_writer.writer());
+            try (frames.HelloFrame{
+                .peer_id = self.id,
+                .public_key = client.keys.public_key,
+            }).write(signing_writer.writer());
+
+            try signing_writer.sign();
+
+            try result.value_ptr.*.flush(allocator);
+
+            var response = std.io.fixedBufferStream(try frames.readFrame(client, allocator));
+            const packet = try Packet.read(response.reader());
+            if (packet.op != .response) {
+                return error.UnexpectedOp;
+            }
+
+            if (packet.tag != .hello) {
+                return error.UnexpectedTag;
+            }
+
+            const frame = try frames.HelloFrame.read(response.reader());
+
+            try client.configurePeer(frame.peer_id, frame.public_key, .keyPair);
+            switch (self.table.put(frame.peer_id)) {
+                .full => log.info("handshaked with {} (peer ignored)", .{frame.peer_id}),
+                .updated => log.info("handshaked with {} (peer updated)", .{frame.peer_id}),
+                .inserted => log.info("handshaked with {} (peer registered)", .{frame.peer_id}),
+            }
+            _ = try scheduler.spawn(Node.runReadLoop, .{ self, allocator, client }, .{});
+        }
+
+        return result.value_ptr.*;
+    }
+
+    fn closeClient(self: *Node, allocator: std.mem.Allocator, client: *Client) void {
+        log.info("closing client {}", .{client.peer_id});
+        coro.io.single(.close_socket, .{ .socket = client.socket }) catch {};
+
+        _ = self.table.delete(client.peer_id.public_key);
+        _ = self.clients.remove(client.address);
+
+        client.deinit(allocator);
+        self.client_pool.destroy(client);
+    }
 };
 
-fn splitHostPort(address: []const u8) !HostPort {
-    var j: usize = 0;
-    var k: usize = 0;
+pub const Client = struct {
+    const log = std.log.scoped(.client);
 
-    const i = mem.lastIndexOfScalar(u8, address, ':') orelse return error.DelimiterNotFound;
+    socket: std.posix.socket_t,
+    address: std.net.Address,
 
-    const host = parse: {
-        if (address[0] == '[') {
-            const end = mem.indexOfScalar(u8, address, ']') orelse return error.MissingEndBracket;
-            if (end + 1 == i) {} else if (end + 1 == address.len) {
-                return error.MissingRightBracket;
-            } else {
-                return error.MissingPort;
+    conn: Connection,
+    peer_id: ID = undefined,
+    keys: X25519.KeyPair,
+
+    read_task: *const coro.Task.Generic(anyerror![]u8) = undefined,
+    can_read: coro.ResetEvent = .{ .is_set = true },
+
+    fn init(allocator: std.mem.Allocator, socket: std.posix.socket_t, address: std.net.Address, node_keys: *Ed25519.KeyPair) !Client {
+        return Client{
+            .socket = socket,
+            .address = address,
+
+            .conn = Connection.init(allocator, .{ .socket = socket }, node_keys),
+            .keys = try X25519.KeyPair.create(null),
+        };
+    }
+
+    fn deinit(self: *Client, allocator: std.mem.Allocator) void {
+        _ = allocator; // autofix
+        self.conn.deinit();
+    }
+
+    fn writer(self: *Client) Connection.Writer {
+        return self.conn.writer();
+    }
+
+    fn flush(self: *Client, allocator: std.mem.Allocator) !void {
+        try self.conn.flush(allocator);
+    }
+
+    fn aquireReader(self: *Client) !void {
+        self.read_task.cancel();
+        self.can_read.reset();
+    }
+
+    fn releaseReader(self: *Client) void {
+        self.can_read.set();
+    }
+
+    fn configurePeer(self: *Client, peer_id: ID, public_key: [32]u8, key_type: enum { remoteKey, keyPair }) !void {
+        _ = key_type; // autofix
+
+        const shared_key = try X25519.scalarmult(self.keys.secret_key, public_key);
+        var shared_secret: [32]u8 = undefined;
+
+        var hasher = std.crypto.hash.Blake3.init(.{});
+        hasher.update(&shared_key);
+        hasher.final(&shared_secret);
+
+        self.peer_id = peer_id;
+        self.conn.flags |= FLAG_SIGNED;
+    }
+};
+
+const Routing = struct {
+    fn nextHop(node: *Node, src: [32]u8, public_key: [32]u8, prev_hops: []const ID) ?ID {
+        if (node.table.get(public_key)) |peer_id| {
+            return peer_id;
+        }
+
+        var peer_ids: [16]ID = undefined;
+        const len = node.table.closestTo(&peer_ids, public_key);
+        for (0..len) |i| {
+            var ok = true;
+            for (prev_hops) |prev| {
+                if (std.mem.eql(u8, &prev.public_key, &src))
+                    continue;
+
+                if (prev.eql(peer_ids[i])) {
+                    ok = false;
+                    break;
+                }
             }
-
-            j = 1;
-            k = end + 1;
-            break :parse address[1..end];
+            if (ok) return peer_ids[i];
         }
 
-        if (mem.indexOfScalar(u8, address[0..i], ':') != null) {
-            return error.TooManyColons;
-        }
-        break :parse address[0..i];
+        return null;
+    }
+};
+
+// TODO: extract
+const FLAG_SIGNED = 0x1;
+const FLAG_ENCRYPTED = 0x2;
+
+const Connection = struct {
+    const log = std.log.scoped(.connection);
+
+    const Writer = std.ArrayList(u8).Writer;
+    const Backend = union(enum) {
+        socket: std.posix.socket_t,
+        connection: *Connection,
     };
 
-    if (mem.indexOfScalar(u8, address[j..], '[') != null) {
-        return error.UnexpectedLeftBracket;
+    write_buffer: std.ArrayList(u8),
+    backend: Backend,
+    flags: u8 = 0x0,
+    node_keys: *Ed25519.KeyPair,
+
+    fn init(allocator: std.mem.Allocator, backend: Backend, node_keys: *Ed25519.KeyPair) Connection {
+        return .{
+            .write_buffer = std.ArrayList(u8).init(allocator),
+            .backend = backend,
+            .node_keys = node_keys,
+        };
     }
-    if (mem.indexOfScalar(u8, address[k..], ']') != null) {
-        return error.UnexpectedRightBracket;
+
+    fn deinit(self: Connection) void {
+        self.write_buffer.deinit();
     }
 
-    const port = address[i + 1 ..];
+    fn writer(self: *Connection) Writer {
+        return self.write_buffer.writer();
+    }
 
-    return HostPort{ .host = host, .port = port };
-}
+    fn flush(self: *Connection, allocator: std.mem.Allocator) !void {
+        log.debug("flushing with flags 0x{x:0>2}", .{self.flags});
 
-fn bootstrapNodeWithPeers(node: *runtime.Node) !void {
-    const log = std.log.scoped(.main);
-    log.info("boostrapping node..", .{});
+        const data_to_write = try self.write_buffer.toOwnedSlice();
+        const is_signed = self.flags & FLAG_SIGNED != 0x0;
+        const is_encrypted = self.flags & FLAG_ENCRYPTED != 0x0;
 
-    var peer_ids: [16]runtime.ID = undefined;
-    const count = node.routing_table.closestTo(&peer_ids, node.id.public_key);
+        defer allocator.free(data_to_write);
 
-    for (0..count) |i| {
-        var client = try node.getOrCreateClient(peer_ids[i].address);
-        try posix.setsockopt(client.socket, posix.SOL.SOCKET, posix.SOCK.NONBLOCK, &std.mem.toBytes(@as(c_int, 0)));
+        var stream = std.io.fixedBufferStream(try allocator.alloc(u8, 1024));
 
-        log.debug("findings node by quering {?}", .{client.conn.peer_id});
-        try (runtime.Packet{
-            .op = .request,
-            .tag = .find_nodes,
-        }).write(client.writer());
+        var out = stream.writer().any();
 
-        try client.writer().writeAll(&node.id.public_key);
-        try client.write();
+        const packet_len = data_to_write.len +
+            (if (is_signed) Ed25519.Signature.encoded_length else 0) +
+            (if (is_encrypted) unreachable else 0);
 
-        const response = try runtime.Packet.read(client.reader());
-        switch (response.op) {
-            .response => {
-                switch (response.tag) {
-                    .find_nodes => {
-                        const len = try client.reader().readInt(u8, .little);
-                        log.debug("{?} provided {} peers", .{ client.conn.peer_id, len });
-                        for (0..len) |_| {
-                            const peer_id = runtime.ID.read(client.reader()) catch break;
-                            _ = node.getOrCreateClient(peer_id.address) catch |err| {
-                                log.warn("could not connect to {}, err: {}", .{ peer_id, err });
-                                continue;
-                            };
-                        }
-                    },
-                    else => {
-                        log.warn("unexpected tag {}", .{response.tag});
-                        break;
-                    },
-                }
-            },
-            else => {
-                log.warn("unexpected op {}", .{response.op});
-                break;
-            },
+        try (PacketHeader{
+            .flags = self.flags,
+            .len = @intCast(packet_len),
+        }).write(out);
+
+        // TODO: should we also sign the header or just the frame?
+        // var signed_writer: ?SigningWriter(std.io.AnyWriter) = signed_writer: {
+        //     if (!is_signed) {
+        //         break :signed_writer null;
+        //     }
+
+        //     log.debug("signing packet with pk: {}", .{fmt.fmtSliceHexLower(&self.node_keys.public_key.bytes)});
+        //     var sw = SigningWriter(std.io.AnyWriter){
+        //         .signer = try self.node_keys.signer(null),
+        //         .underlying_stream = out,
+        //     };
+
+        //     out = sw.writer().any();
+        //     break :signed_writer sw;
+        // };
+
+        // TODO: encrypt
+
+        try out.writeAll(data_to_write);
+
+        if (is_signed) {
+            // TODO: use signing writer
+            const sig = try self.node_keys.sign(data_to_write, null);
+            try out.writeAll(&sig.toBytes());
+            // try signed_writer.?.sign();
         }
 
-        try posix.setsockopt(client.socket, posix.SOL.SOCKET, posix.SOCK.NONBLOCK, &std.mem.toBytes(@as(c_int, 1)));
+        switch (self.backend) {
+            .socket => |socket| {
+                try aio.single(.send, .{ .socket = socket, .buffer = stream.getWritten() });
+            },
+            .connection => |conn| {
+                try conn.writer().writeAll(stream.getWritten());
+            },
+        }
     }
-}
+};
 
-test "use X25519 to generate sk based on X25519 KeyPair" {
-    const bob = try std.crypto.dh.X25519.KeyPair.create(null);
-    const alice = try std.crypto.dh.X25519.KeyPair.create(null);
-    std.log.debug("bob pub: {}", .{fmt.fmtSliceHexLower(&bob.public_key)});
-    std.log.debug("bob priv: {}", .{fmt.fmtSliceHexLower(&bob.secret_key)});
+fn SigningWriter(comptime WriterType: type) type {
+    const log = std.log.scoped(.signing_writer);
+    _ = log; // autofix
 
-    std.log.debug("alice pub: {}", .{fmt.fmtSliceHexLower(&alice.public_key)});
-    std.log.debug("alice priv: {}", .{fmt.fmtSliceHexLower(&alice.secret_key)});
+    return struct {
+        const Self = @This();
+        pub const Error = WriterType.Error;
+        pub const Writer = std.io.Writer(*Self, Error, write);
 
-    const bob_secret = bob.secret_key;
-    const alice_secret = alice.secret_key;
-    const sk_bob = try std.crypto.dh.X25519.scalarmult(bob_secret, alice.public_key);
-    const sk_alice = try std.crypto.dh.X25519.scalarmult(alice_secret, bob.public_key);
+        underlying_stream: WriterType,
+        signer: Ed25519.Signer,
 
-    std.log.debug("bob sk: {}", .{fmt.fmtSliceHexLower(&sk_bob)});
-    std.log.debug("alice sk: {}", .{fmt.fmtSliceHexLower(&sk_alice)});
-    try std.testing.expectEqualSlices(u8, &sk_bob, &sk_alice);
+        pub fn write(self: *Self, bytes: []const u8) Error!usize {
+            self.signer.update(bytes);
+
+            return self.underlying_stream.write(bytes);
+        }
+
+        pub fn writer(self: *Self) Writer {
+            return .{ .context = self };
+        }
+
+        fn sign(self: *Self) Error!void {
+            const signature = self.signer.finalize();
+
+            return self.underlying_stream.writeAll(&signature.toBytes());
+        }
+    };
 }

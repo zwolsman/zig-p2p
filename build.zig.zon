@@ -27,6 +27,10 @@
             .url = "https://github.com/n0s4/flags/archive/refs/heads/latest-zig-release.zip",
             .hash = "122059d5038f033fb98db8e15206540a4da3b2c90abe59b6766df993ec6c44ee4745",
         },
+        .@"zig-aio" = .{
+            .url = "https://github.com/Cloudef/zig-aio/archive/refs/heads/zig-0.13.zip",
+            .hash = "122097800ba115d53b02559f4f5d2ac045765a93d416ac4c6aeb5cbaf54d23294526",
+        },
     },
     .paths = .{
         "build.zig",
