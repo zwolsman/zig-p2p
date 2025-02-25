@@ -6,6 +6,7 @@ const Ed25519 = std.crypto.sign.Ed25519;
 const ID = @import("../kademlia.zig").ID;
 const Client = @import("../main.zig").Client;
 const PacketHeader = @import("./packet.zig").PacketHeader;
+const EncryptionMetadata = @import("./packet.zig").EncryptionMetadata;
 
 pub const HelloFrame = struct {
     const Self = @This();
@@ -145,28 +146,34 @@ pub fn readFrame(client: *Client, allocator: std.mem.Allocator) anyerror![]u8 {
 }
 
 pub fn processFrame(allocator: std.mem.Allocator, client: *Client, packet_header: PacketHeader, raw_frame: []u8) ![]u8 {
-    if (packet_header.flags == 0x0) {
-        const frame = try allocator.dupe(u8, raw_frame);
-
-        return frame;
-    }
+    var frame = try allocator.dupe(u8, raw_frame);
 
     // TODO: extract flags
     if (packet_header.flags & 0x1 != 0x0) {
         var signature: [Ed25519.Signature.encoded_length]u8 = undefined;
-        const frame = try allocator.alloc(u8, raw_frame.len - signature.len);
 
-        @memcpy(&signature, raw_frame[raw_frame.len - signature.len ..]);
-        @memcpy(frame, raw_frame[0 .. raw_frame.len - signature.len]);
+        @memcpy(&signature, frame[frame.len - signature.len ..]);
+        frame = frame[0 .. frame.len - signature.len];
 
         verifySignature(client.peer_id.public_key, signature, frame) catch |err| {
             return err;
         };
-
-        return frame;
     }
 
-    return raw_frame;
+    if (packet_header.flags & 0x2 != 0x0) {
+        var session = client.conn.session orelse return error.MissingSession;
+        var stream = std.io.fixedBufferStream(frame);
+        const encryption_metadata = try EncryptionMetadata.read(stream.reader());
+
+        frame = try session.decrypt(.{
+            .dh = encryption_metadata.dh,
+            .n = encryption_metadata.n,
+            .pn = encryption_metadata.pn,
+            .cipher_text = stream.buffer[stream.pos..],
+        });
+    }
+
+    return frame;
 }
 
 fn verifySignature(public_key: [32]u8, raw_signature: [64]u8, msg: []u8) !void {

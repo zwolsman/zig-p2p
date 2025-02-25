@@ -38,6 +38,8 @@ pub const Packet = struct {
 };
 
 pub const PacketHeader = struct {
+    pub const size: u32 = @sizeOf(u32) + @sizeOf(u8);
+
     len: u32,
     flags: u8,
 
@@ -58,17 +60,19 @@ pub const PacketHeader = struct {
 };
 
 pub const EncryptionMetadata = struct {
+    pub const size: u32 = @sizeOf([32]u8) + @sizeOf(u32) + @sizeOf(u32);
+
     dh: [32]u8,
     n: u32,
     pn: u32,
 
-    fn write(metadata: EncryptionMetadata, writer: anytype) !void {
+    pub fn write(metadata: EncryptionMetadata, writer: anytype) !void {
         try writer.writeAll(&metadata.dh);
         try writer.writeInt(u32, metadata.n, .little);
         try writer.writeInt(u32, metadata.pn, .little);
     }
 
-    fn read(reader: anytype) !EncryptionMetadata {
+    pub fn read(reader: anytype) !EncryptionMetadata {
         const dh = try reader.readBytesNoEof(32);
         const n = try reader.readInt(u32, .little);
         const pn = try reader.readInt(u32, .little);

@@ -20,6 +20,11 @@ pub fn initRemoteKey(allocator: std.mem.Allocator, id: []const u8, shared_key: [
     return Session.initRemoteKey(allocator, id, shared_key, remote_key);
 }
 
+pub fn randomId() []u8 {
+    var id: [16]u8 = undefined;
+    crypto.random.bytes(&id);
+    return &id;
+}
 fn kdfRk(rootKey: [32]u8, dhOut: [32]u8) struct {
     root_key: [32]u8,
     chain_key: [32]u8,

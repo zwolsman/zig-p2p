@@ -6,10 +6,12 @@ const fmt = std.fmt;
 const stdx = @import("stdx.zig");
 const aio = @import("aio");
 const coro = @import("coro");
+const e2e = @import("./e2e.zig");
 
 const frames = @import("./network/frame.zig");
 const Packet = @import("./network/packet.zig").Packet;
 const PacketHeader = @import("./network//packet.zig").PacketHeader;
+const EncryptionMetadata = @import("./network//packet.zig").EncryptionMetadata;
 
 const Ed25519 = std.crypto.sign.Ed25519;
 const X25519 = std.crypto.dh.X25519;
@@ -283,8 +285,6 @@ const Node = struct {
                 log.warn("could not handle server packet: {}", .{err});
                 continue;
             };
-
-            allocator.free(frame);
         }
     }
 
@@ -330,7 +330,7 @@ const Node = struct {
 
                         try client.flush(allocator);
 
-                        try client.configurePeer(frame.peer_id, frame.public_key, .remoteKey);
+                        try client.configurePeer(allocator, frame.peer_id, frame.public_key, .remoteKey);
                     },
                     .find_nodes => {
                         const public_key = try reader.readBytesNoEof(32);
@@ -465,7 +465,7 @@ const Node = struct {
 
             const frame = try frames.HelloFrame.read(response.reader());
 
-            try client.configurePeer(frame.peer_id, frame.public_key, .keyPair);
+            try client.configurePeer(allocator, frame.peer_id, frame.public_key, .keyPair);
             switch (self.table.put(frame.peer_id)) {
                 .full => log.info("handshaked with {} (peer ignored)", .{frame.peer_id}),
                 .updated => log.info("handshaked with {} (peer updated)", .{frame.peer_id}),
@@ -534,9 +534,7 @@ pub const Client = struct {
         self.can_read.set();
     }
 
-    fn configurePeer(self: *Client, peer_id: ID, public_key: [32]u8, key_type: enum { remoteKey, keyPair }) !void {
-        _ = key_type; // autofix
-
+    fn configurePeer(self: *Client, allocator: std.mem.Allocator, peer_id: ID, public_key: [32]u8, key_type: enum { remoteKey, keyPair }) !void {
         const shared_key = try X25519.scalarmult(self.keys.secret_key, public_key);
         var shared_secret: [32]u8 = undefined;
 
@@ -545,7 +543,14 @@ pub const Client = struct {
         hasher.final(&shared_secret);
 
         self.peer_id = peer_id;
+
+        self.conn.session = switch (key_type) {
+            .keyPair => e2e.init(allocator, e2e.randomId(), shared_secret, self.keys),
+            .remoteKey => try e2e.initRemoteKey(allocator, e2e.randomId(), shared_secret, public_key),
+        };
+
         self.conn.flags |= FLAG_SIGNED;
+        self.conn.flags |= FLAG_ENCRYPTED;
     }
 };
 
@@ -592,6 +597,7 @@ const Connection = struct {
     backend: Backend,
     flags: u8 = 0x0,
     node_keys: *Ed25519.KeyPair,
+    session: ?e2e.Session = null,
 
     fn init(allocator: std.mem.Allocator, backend: Backend, node_keys: *Ed25519.KeyPair) Connection {
         return .{
@@ -612,51 +618,55 @@ const Connection = struct {
     fn flush(self: *Connection, allocator: std.mem.Allocator) !void {
         log.debug("flushing with flags 0x{x:0>2}", .{self.flags});
 
-        const data_to_write = try self.write_buffer.toOwnedSlice();
+        var data_to_write = try self.write_buffer.toOwnedSlice();
         const is_signed = self.flags & FLAG_SIGNED != 0x0;
         const is_encrypted = self.flags & FLAG_ENCRYPTED != 0x0;
 
-        defer allocator.free(data_to_write);
-
         var stream = std.io.fixedBufferStream(try allocator.alloc(u8, 1024));
+        var encryption_metadata: ?EncryptionMetadata = null;
 
         var out = stream.writer().any();
 
+        if (is_encrypted) {
+            var session = self.session orelse return error.MissingSession;
+            const message = try session.encrypt(data_to_write);
+
+            encryption_metadata = EncryptionMetadata{
+                .dh = message.dh,
+                .n = message.n,
+                .pn = message.pn,
+            };
+
+            data_to_write = message.cipher_text;
+        }
+
         const packet_len = data_to_write.len +
             (if (is_signed) Ed25519.Signature.encoded_length else 0) +
-            (if (is_encrypted) unreachable else 0);
+            (if (is_encrypted) EncryptionMetadata.size else 0);
 
         try (PacketHeader{
             .flags = self.flags,
             .len = @intCast(packet_len),
         }).write(out);
 
-        // TODO: should we also sign the header or just the frame?
-        // var signed_writer: ?SigningWriter(std.io.AnyWriter) = signed_writer: {
-        //     if (!is_signed) {
-        //         break :signed_writer null;
-        //     }
-
-        //     log.debug("signing packet with pk: {}", .{fmt.fmtSliceHexLower(&self.node_keys.public_key.bytes)});
-        //     var sw = SigningWriter(std.io.AnyWriter){
-        //         .signer = try self.node_keys.signer(null),
-        //         .underlying_stream = out,
-        //     };
-
-        //     out = sw.writer().any();
-        //     break :signed_writer sw;
-        // };
-
-        // TODO: encrypt
+        if (encryption_metadata) |metadata| {
+            try metadata.write(out);
+        }
 
         try out.writeAll(data_to_write);
 
         if (is_signed) {
+            // TODO: should we also sign the header or just the frame?
             // TODO: use signing writer
-            const sig = try self.node_keys.sign(data_to_write, null);
+            const msg = stream.buffer[5..stream.pos];
+            const sig = try self.node_keys.sign(msg, null);
+
             try out.writeAll(&sig.toBytes());
             // try signed_writer.?.sign();
         }
+
+        // total data written = packet header + packet frame
+        std.debug.assert(PacketHeader.size + packet_len == stream.getWritten().len);
 
         switch (self.backend) {
             .socket => |socket| {
