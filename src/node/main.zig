@@ -138,6 +138,12 @@ fn openTTY(node: *Node, allocator: std.mem.Allocator) !void {
         } else if (std.mem.startsWith(u8, command, "echo ")) {
             const message = command["echo ".len..];
             std.debug.print("{s}\n", .{message});
+        } else if (std.mem.eql(u8, "peers", command)) {
+            log.debug("connected to {} peers", .{node.clients.size});
+            var it = node.clients.valueIterator();
+            while (it.next()) |client| {
+                std.debug.print("connected to {}\n", .{client.*.peer_id});
+            }
         } else if (std.mem.startsWith(u8, command, "route ")) {
             const route_data = command["route ".len..];
 
@@ -264,6 +270,7 @@ const Node = struct {
                 return err;
             };
             errdefer client.deinit(allocator);
+            try self.clients.put(allocator, client_addr, client);
 
             _ = try scheduler.spawn(Node.runReadLoop, .{ self, allocator, client }, .{});
         }
