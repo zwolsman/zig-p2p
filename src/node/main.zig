@@ -179,7 +179,7 @@ fn openTTY(node: *Node, allocator: std.mem.Allocator) !void {
             const remote_public_key = try X25519.publicKeyFromEd25519(try Ed25519.PublicKey.fromBytes(dest_key));
             const shared_key = try X25519.scalarmult(keypair.secret_key, remote_public_key);
             dest_conn.session = try Routing.getOrCreateSession(allocator, shared_key, .{ .keypair = keypair });
-            dest_conn.flags = 0x2; // encyrpted TODO: extract
+            dest_conn.flags = 0x3; // encyrpted TODO: extract
 
             try (Packet{
                 .op = .command,
