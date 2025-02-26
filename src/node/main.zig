@@ -175,6 +175,12 @@ fn openTTY(node: *Node, allocator: std.mem.Allocator) !void {
 
             var dest_conn = Connection.init(allocator, .{ .connection = &next_hop.conn }, &node.keys);
 
+            const keypair = try X25519.KeyPair.fromEd25519(node.keys);
+            const remote_public_key = try X25519.publicKeyFromEd25519(try Ed25519.PublicKey.fromBytes(dest_key));
+            const shared_key = try X25519.scalarmult(keypair.secret_key, remote_public_key);
+            dest_conn.session = try Routing.getOrCreateSession(allocator, shared_key, .{ .keypair = keypair });
+            dest_conn.flags = 0x2; // encyrpted TODO: extract
+
             try (Packet{
                 .op = .command,
                 .tag = .echo,
@@ -252,12 +258,7 @@ const Node = struct {
             const client: *Client = try self.client_pool.create();
             errdefer self.client_pool.destroy(client);
 
-            client.* = Client.init(
-                allocator,
-                client_socket,
-                client_addr,
-                &self.keys,
-            ) catch |err| {
+            client.* = Client.init(allocator, client_socket, client_addr, &self.keys) catch |err| {
                 coro.io.single(.close_socket, .{ .socket = client_socket }) catch {};
                 log.err("failed to initialize client: {}", .{err});
                 return err;
@@ -360,7 +361,15 @@ const Node = struct {
                         // well, it's received
                         if (std.mem.eql(u8, &frame.dst, &self.id.public_key)) {
                             const header = try PacketHeader.read(reader);
-                            const original_frame = try frames.processFrame(allocator, client, header, stream.buffer[stream.pos..]);
+                            const keypair = try X25519.KeyPair.fromEd25519(self.keys);
+                            const remote_public_key = try X25519.publicKeyFromEd25519(try Ed25519.PublicKey.fromBytes(frame.src));
+                            const shared_secret = try X25519.scalarmult(keypair.secret_key, remote_public_key);
+
+                            const session = try Routing.getOrCreateSession(allocator, shared_secret, .{ .remote_key = remote_public_key });
+
+                            const original_frame = try frames.processFrame(allocator, frame.src, session, header, stream.buffer[stream.pos..]);
+                            log.debug("key count: {}", .{session.state.keys_count});
+
                             return self.handleServerPacket(allocator, client, original_frame);
                         }
 
@@ -544,10 +553,13 @@ pub const Client = struct {
 
         self.peer_id = peer_id;
 
-        self.conn.session = switch (key_type) {
+        const session = try allocator.create(e2e.Session);
+        session.* = switch (key_type) {
             .keyPair => e2e.init(allocator, e2e.randomId(), shared_secret, self.keys),
             .remoteKey => try e2e.initRemoteKey(allocator, e2e.randomId(), shared_secret, public_key),
         };
+
+        self.conn.session = session;
 
         self.conn.flags |= FLAG_SIGNED;
         self.conn.flags |= FLAG_ENCRYPTED;
@@ -555,6 +567,9 @@ pub const Client = struct {
 };
 
 const Routing = struct {
+    const log = std.log.scoped(.routing);
+    var sessions: Kademlia.StaticHashMap([32]u8, *e2e.Session, std.hash_map.AutoContext([32]u8), 128) = .{};
+
     fn nextHop(node: *Node, src: [32]u8, public_key: [32]u8, prev_hops: []const ID) ?ID {
         if (node.table.get(public_key)) |peer_id| {
             return peer_id;
@@ -578,6 +593,22 @@ const Routing = struct {
 
         return null;
     }
+
+    fn getOrCreateSession(allocator: std.mem.Allocator, key: [32]u8, key_type: union(enum) { keypair: X25519.KeyPair, remote_key: [32]u8 }) !*e2e.Session {
+        const result = Routing.sessions.getOrPutAssumeCapacity(key);
+        if (!result.found_existing) {
+            const session = try allocator.create(e2e.Session);
+            log.debug("creating new session for {}", .{fmt.fmtSliceHexLower(&key)});
+            session.* = switch (key_type) {
+                .keypair => |kp| e2e.init(allocator, e2e.randomId(), key, kp),
+                .remote_key => |remote_key| try e2e.initRemoteKey(allocator, e2e.randomId(), key, remote_key),
+            };
+
+            result.value_ptr.* = session;
+        }
+
+        return result.value_ptr.*;
+    }
 };
 
 // TODO: extract
@@ -597,7 +628,7 @@ const Connection = struct {
     backend: Backend,
     flags: u8 = 0x0,
     node_keys: *Ed25519.KeyPair,
-    session: ?e2e.Session = null,
+    session: ?*e2e.Session = null,
 
     fn init(allocator: std.mem.Allocator, backend: Backend, node_keys: *Ed25519.KeyPair) Connection {
         return .{

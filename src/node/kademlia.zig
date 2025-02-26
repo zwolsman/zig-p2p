@@ -259,7 +259,7 @@ pub const RoutingTable = struct {
     }
 };
 
-fn StaticHashMap(comptime K: type, comptime V: type, comptime Context: type, comptime capacity: usize) type {
+pub fn StaticHashMap(comptime K: type, comptime V: type, comptime Context: type, comptime capacity: usize) type {
     assert(math.isPowerOfTwo(capacity));
 
     const shift = 63 - math.log2_int(u64, capacity) + 1;

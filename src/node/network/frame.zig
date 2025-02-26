@@ -7,6 +7,7 @@ const ID = @import("../kademlia.zig").ID;
 const Client = @import("../main.zig").Client;
 const PacketHeader = @import("./packet.zig").PacketHeader;
 const EncryptionMetadata = @import("./packet.zig").EncryptionMetadata;
+const Session = @import("../e2e.zig").Session;
 
 pub const HelloFrame = struct {
     const Self = @This();
@@ -141,11 +142,14 @@ pub fn readFrame(client: *Client, allocator: std.mem.Allocator) anyerror![]u8 {
     defer allocator.free(raw_frame);
 
     try buffer.reader().readNoEof(raw_frame);
-    const processed_frame = try processFrame(allocator, client, packet_header, raw_frame);
+    const session: ?*Session = if (client.conn.session) |_| client.conn.session.? else null;
+
+    const processed_frame = try processFrame(allocator, client.peer_id.public_key, session, packet_header, raw_frame);
     return processed_frame;
 }
 
-pub fn processFrame(allocator: std.mem.Allocator, client: *Client, packet_header: PacketHeader, raw_frame: []u8) ![]u8 {
+pub fn processFrame(allocator: std.mem.Allocator, peer_id_pk: [32]u8, session: ?*Session, packet_header: PacketHeader, raw_frame: []u8) ![]u8 {
+    std.log.debug("{} => process frame: {x}", .{ packet_header, raw_frame });
     var frame = try allocator.dupe(u8, raw_frame);
 
     // TODO: extract flags
@@ -154,18 +158,20 @@ pub fn processFrame(allocator: std.mem.Allocator, client: *Client, packet_header
 
         @memcpy(&signature, frame[frame.len - signature.len ..]);
         frame = frame[0 .. frame.len - signature.len];
+        std.log.debug("verifying sig: {}", .{std.fmt.fmtSliceHexLower(&signature)});
 
-        verifySignature(client.peer_id.public_key, signature, frame) catch |err| {
+        verifySignature(peer_id_pk, signature, frame) catch |err| {
             return err;
         };
+        std.log.debug("verifying sig: {} (ok)", .{std.fmt.fmtSliceHexLower(&signature)});
     }
 
     if (packet_header.flags & 0x2 != 0x0) {
-        var session = client.conn.session orelse return error.MissingSession;
+        var s = session orelse return error.MissingSession;
         var stream = std.io.fixedBufferStream(frame);
         const encryption_metadata = try EncryptionMetadata.read(stream.reader());
 
-        frame = try session.decrypt(.{
+        frame = try s.decrypt(.{
             .dh = encryption_metadata.dh,
             .n = encryption_metadata.n,
             .pn = encryption_metadata.pn,
