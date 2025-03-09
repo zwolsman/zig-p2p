@@ -208,7 +208,7 @@ fn openTTY(node: *Node, allocator: std.mem.Allocator) !void {
 
             try (frames.BroadcastFrame{
                 .src = node.id.public_key,
-                .nonce = frames.BroadcastFrame.randomNonce(),
+                .nonce = frames.randomNonce(),
                 .ts = std.time.nanoTimestamp() + std.time.ns_per_s * 5, // set the deadline
                 .n = 0,
             }).write(frame.writer());
@@ -352,6 +352,8 @@ const Node = struct {
                             .underlying_stream = client.writer(),
                         };
 
+                        const nonce = frames.randomNonce();
+
                         try (Packet{
                             .op = .response,
                             .tag = .hello,
@@ -360,13 +362,14 @@ const Node = struct {
                         try (frames.HelloFrame{
                             .peer_id = self.id,
                             .public_key = client.keys.public_key,
+                            .nonce = nonce,
                         }).write(signing_writer.writer());
 
                         try signing_writer.sign();
 
                         try client.flush(allocator);
 
-                        try client.configurePeer(allocator, frame.peer_id, frame.public_key, .remoteKey);
+                        try client.configurePeer(allocator, frame.peer_id, frame.public_key, frame.nonce ++ nonce, .remoteKey);
                     },
                     .find_nodes => {
                         const public_key = try reader.readBytesNoEof(32);
@@ -537,6 +540,8 @@ const Node = struct {
                 .underlying_stream = result.value_ptr.*.writer(),
             };
 
+            const nonce = frames.randomNonce();
+
             try (Packet{
                 .op = .request,
                 .tag = .hello,
@@ -544,6 +549,7 @@ const Node = struct {
             try (frames.HelloFrame{
                 .peer_id = self.id,
                 .public_key = client.keys.public_key,
+                .nonce = nonce,
             }).write(signing_writer.writer());
 
             try signing_writer.sign();
@@ -562,7 +568,7 @@ const Node = struct {
 
             const frame = try frames.HelloFrame.read(response.reader());
 
-            try client.configurePeer(allocator, frame.peer_id, frame.public_key, .keyPair);
+            try client.configurePeer(allocator, frame.peer_id, frame.public_key, nonce ++ frame.nonce, .keyPair);
             switch (self.table.put(frame.peer_id)) {
                 .full => log.info("handshaked with {} (peer ignored)", .{frame.peer_id}),
                 .updated => log.info("handshaked with {} (peer updated)", .{frame.peer_id}),
@@ -631,12 +637,13 @@ pub const Client = struct {
         self.can_read.set();
     }
 
-    fn configurePeer(self: *Client, allocator: std.mem.Allocator, peer_id: ID, public_key: [32]u8, key_type: enum { remoteKey, keyPair }) !void {
+    fn configurePeer(self: *Client, allocator: std.mem.Allocator, peer_id: ID, public_key: [32]u8, nonce: [32]u8, key_type: enum { remoteKey, keyPair }) !void {
         const shared_key = try X25519.scalarmult(self.keys.secret_key, public_key);
         var shared_secret: [32]u8 = undefined;
 
         var hasher = std.crypto.hash.Blake3.init(.{});
         hasher.update(&shared_key);
+        hasher.update(&nonce);
         hasher.final(&shared_secret);
 
         self.peer_id = peer_id;

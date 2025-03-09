@@ -1,28 +1,31 @@
 const std = @import("std");
+const Ed25519 = std.crypto.sign.Ed25519;
 
 const coro = @import("coro");
 
-const Ed25519 = std.crypto.sign.Ed25519;
+const Session = @import("../e2e.zig").Session;
 const ID = @import("../kademlia.zig").ID;
 const Client = @import("../main.zig").Client;
 const PacketHeader = @import("./packet.zig").PacketHeader;
 const EncryptionMetadata = @import("./packet.zig").EncryptionMetadata;
-const Session = @import("../e2e.zig").Session;
 
 pub const HelloFrame = struct {
     const Self = @This();
     peer_id: ID,
     public_key: [32]u8,
+    nonce: [16]u8,
 
     pub fn read(reader: anytype) !Self {
         const peer_id = try ID.read(reader);
         const key = try reader.readBytesNoEof(32);
-        return .{ .peer_id = peer_id, .public_key = key };
+        const nonce = try reader.readBytesNoEof(16);
+        return .{ .peer_id = peer_id, .public_key = key, .nonce = nonce };
     }
 
     pub fn write(frame: Self, writer: anytype) !void {
         try frame.peer_id.write(writer);
         try writer.writeAll(&frame.public_key);
+        try writer.writeAll(&frame.nonce);
     }
 };
 
@@ -148,13 +151,13 @@ pub const BroadcastFrame = struct {
         try writer.writeInt(i128, frame.ts, .little);
         try writer.writeInt(u8, frame.n, .little);
     }
-
-    pub fn randomNonce() [16]u8 {
-        var buff: [16]u8 = undefined;
-        std.crypto.random.bytes(&buff);
-        return buff;
-    }
 };
+
+pub fn randomNonce() [16]u8 {
+    var buff: [16]u8 = undefined;
+    std.crypto.random.bytes(&buff);
+    return buff;
+}
 
 pub fn readFrame(client: *Client, allocator: std.mem.Allocator) anyerror![]u8 {
     var buffer = std.fifo.LinearFifo(u8, .Dynamic).init(allocator);
@@ -183,7 +186,6 @@ pub fn readFrame(client: *Client, allocator: std.mem.Allocator) anyerror![]u8 {
 }
 
 pub fn processFrame(allocator: std.mem.Allocator, peer_id_pk: [32]u8, session: ?*Session, packet_header: PacketHeader, raw_frame: []u8) ![]u8 {
-    std.log.debug("{} => process frame: {x}", .{ packet_header, raw_frame });
     var frame = try allocator.dupe(u8, raw_frame);
 
     // TODO: extract flags
@@ -192,9 +194,9 @@ pub fn processFrame(allocator: std.mem.Allocator, peer_id_pk: [32]u8, session: ?
 
         @memcpy(&signature, frame[frame.len - signature.len ..]);
         frame = frame[0 .. frame.len - signature.len];
-        std.log.debug("verifying sig: {}", .{std.fmt.fmtSliceHexLower(&signature)});
 
         verifySignature(peer_id_pk, signature, frame) catch |err| {
+            std.log.debug("verifying sig: {} ({})", .{ std.fmt.fmtSliceHexLower(&signature), err });
             return err;
         };
         std.log.debug("verifying sig: {} (ok)", .{std.fmt.fmtSliceHexLower(&signature)});
