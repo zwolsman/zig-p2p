@@ -81,7 +81,7 @@ fn _encrypt(mk: [32]u8, in: []const u8, ad: []const u8) ![]u8 {
     @memcpy(out[0..16], &keys.iv);
 
     const ctx = Aes256.initEnc(keys.enc_key);
-    crypto.core.modes.ctr(AesEncryptCtx(Aes256), ctx, out[16 .. 16 + in.len], in, keys.iv, .little);
+    ctr(AesEncryptCtx(Aes256), ctx, out[16 .. 16 + in.len], in, keys.iv, .little);
 
     const sig = computeSignature(keys.auth_key, out[0 .. out.len - 32], ad);
 

@@ -122,6 +122,40 @@ pub const EchoFrame = struct {
     }
 };
 
+pub const BroadcastFrame = struct {
+    src: [32]u8,
+    nonce: [16]u8,
+    ts: i128, // ts in ns
+    n: u8, // amount of hops
+
+    pub fn read(reader: anytype) !BroadcastFrame {
+        const src = try reader.readBytesNoEof(32);
+        const nonce = try reader.readBytesNoEof(16);
+        const ts = try reader.readInt(i128, .little);
+        const n = try reader.readInt(u8, .little);
+
+        return .{
+            .src = src,
+            .nonce = nonce,
+            .ts = ts,
+            .n = n,
+        };
+    }
+
+    pub fn write(frame: BroadcastFrame, writer: anytype) !void {
+        try writer.writeAll(&frame.src);
+        try writer.writeAll(&frame.nonce);
+        try writer.writeInt(i128, frame.ts, .little);
+        try writer.writeInt(u8, frame.n, .little);
+    }
+
+    pub fn randomNonce() [16]u8 {
+        var buff: [16]u8 = undefined;
+        std.crypto.random.bytes(&buff);
+        return buff;
+    }
+};
+
 pub fn readFrame(client: *Client, allocator: std.mem.Allocator) anyerror![]u8 {
     var buffer = std.fifo.LinearFifo(u8, .Dynamic).init(allocator);
 

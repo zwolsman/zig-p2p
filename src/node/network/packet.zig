@@ -15,6 +15,7 @@ pub const Packet = struct {
         find_nodes,
         route,
         echo,
+        broadcast,
     };
 
     op: Op,

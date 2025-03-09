@@ -2,24 +2,22 @@ const std = @import("std");
 const net = std.net;
 const posix = std.posix;
 const fmt = std.fmt;
-
-const stdx = @import("stdx.zig");
-const aio = @import("aio");
-const coro = @import("coro");
-const e2e = @import("./e2e.zig");
-
-const frames = @import("./network/frame.zig");
-const Packet = @import("./network/packet.zig").Packet;
-const PacketHeader = @import("./network//packet.zig").PacketHeader;
-const EncryptionMetadata = @import("./network//packet.zig").EncryptionMetadata;
-
 const Ed25519 = std.crypto.sign.Ed25519;
 const X25519 = std.crypto.dh.X25519;
+
+const aio = @import("aio");
+const coro = @import("coro");
+const flags = @import("flags");
+
+const e2e = @import("./e2e.zig");
+const PacketHeader = @import("./network//packet.zig").PacketHeader;
+const EncryptionMetadata = @import("./network//packet.zig").EncryptionMetadata;
+const frames = @import("./network/frame.zig");
+const Packet = @import("./network/packet.zig").Packet;
+const CliFlags = @import("cliflags.zig");
 const Kademlia = @import("kademlia.zig");
 const ID = Kademlia.ID;
-
-const flags = @import("flags");
-const CliFlags = @import("cliflags.zig");
+const stdx = @import("stdx.zig");
 
 pub const std_options: std.Options = .{
     .log_level = .debug,
@@ -199,6 +197,33 @@ fn openTTY(node: *Node, allocator: std.mem.Allocator) !void {
             try dest_conn.flush(allocator);
             try next_hop.flush(allocator);
             log.info("routed packet to {}", .{fmt.fmtSliceHexLower(&dest_key)});
+        } else if (std.mem.startsWith(u8, command, "broadcast ")) {
+            const msg = command["broadcast ".len..];
+            var frame = std.ArrayList(u8).init(allocator);
+
+            try (Packet{
+                .op = .command,
+                .tag = .broadcast,
+            }).write(frame.writer());
+
+            try (frames.BroadcastFrame{
+                .src = node.id.public_key,
+                .nonce = frames.BroadcastFrame.randomNonce(),
+                .ts = std.time.nanoTimestamp() + std.time.ns_per_s * 5, // set the deadline
+                .n = 0,
+            }).write(frame.writer());
+
+            try (Packet{
+                .op = .command,
+                .tag = .echo,
+            }).write(frame.writer());
+            try (frames.EchoFrame{
+                .txt = msg,
+            }).write(frame.writer());
+
+            const c: *Client = undefined; // TODO: hacky null pointer
+
+            try node.handleServerPacket(allocator, c, try frame.toOwnedSlice());
         }
     }
 }
@@ -217,6 +242,8 @@ const Node = struct {
     clients: std.HashMapUnmanaged(net.Address, *Client, stdx.AddressContext, std.hash_map.default_max_load_percentage),
     client_pool: std.heap.MemoryPool(Client),
 
+    processed_nonces: std.AutoHashMap([16]u8, void),
+
     fn init(self: *Self, allocator: std.mem.Allocator, keys: Ed25519.KeyPair, address: std.net.Address) !void {
         self.id = .{ .public_key = keys.public_key.toBytes(), .address = address };
         self.keys = keys;
@@ -225,6 +252,7 @@ const Node = struct {
         self.table = .{ .public_key = keys.public_key.toBytes() };
 
         self.client_pool = std.heap.MemoryPool(Client).init(allocator);
+        self.processed_nonces = std.AutoHashMap([16]u8, void).init(allocator);
     }
 
     fn bind(self: *Self) !void {
@@ -411,6 +439,59 @@ const Node = struct {
                         const frame = try frames.EchoFrame.read(allocator, reader);
 
                         std.debug.print("{s}\n", .{frame.txt});
+                    },
+                    .broadcast => {
+                        const frame = try frames.BroadcastFrame.read(reader);
+
+                        if (frame.n == 5) {
+                            log.debug("processing broadcast {} (ignored: n = 5)", .{fmt.fmtSliceHexLower(&frame.nonce)});
+                            return;
+                        }
+
+                        if (std.time.nanoTimestamp() > frame.ts) {
+                            log.debug("processing broadcast {} (ignored: now>ts)", .{fmt.fmtSliceHexLower(&frame.nonce)});
+                        }
+
+                        const nonce_entry = try self.processed_nonces.getOrPut(frame.nonce);
+                        if (nonce_entry.found_existing) {
+                            log.debug("processing broadcast {} (ignored: processed)", .{fmt.fmtSliceHexLower(&frame.nonce)});
+                            return;
+                        }
+
+                        var it = self.clients.valueIterator(); // TODO: randomize? A map does not guarantee order anyway..?
+                        const frame_to_broadcast = stream.buffer[stream.pos..];
+                        stream.seekTo(stream.buffer.len) catch unreachable;
+
+                        try self.handleServerPacket(allocator, client, frame_to_broadcast);
+
+                        var count: u32 = 0;
+                        while (it.next()) |candidate| {
+                            if (count == 5)
+                                break;
+
+                            if (std.mem.eql(u8, &candidate.*.peer_id.public_key, &frame.src))
+                                continue;
+
+                            try (Packet{
+                                .op = .command,
+                                .tag = .broadcast,
+                            }).write(candidate.*.writer());
+
+                            try (frames.BroadcastFrame{
+                                .src = frame.src,
+                                .nonce = frame.nonce,
+                                .ts = frame.ts,
+                                .n = frame.n + 1,
+                            }).write(candidate.*.writer());
+
+                            try candidate.*.writer().writeAll(frame_to_broadcast);
+                            try candidate.*.flush(allocator);
+
+                            count += 1;
+                        }
+
+                        try self.processed_nonces.put(frame.nonce, {});
+                        log.debug("processing broadcast {} (ok: {} peers)", .{ fmt.fmtSliceHexLower(&frame.nonce), count });
                     },
                     else => return error.UnexpectedTag,
                 }
