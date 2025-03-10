@@ -37,7 +37,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // get the "zig-aio" dependency from "build.zig.zon"
-    const zig_aio = b.dependency("zig-aio", .{});
+    const zig_aio = b.dependency("aio", .{});
     // for exe, lib, tests, etc.
     node.root_module.addImport("aio", zig_aio.module("aio"));
     // for coroutines api

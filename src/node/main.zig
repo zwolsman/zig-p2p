@@ -35,16 +35,13 @@ pub fn main() !void {
     scheduler = try coro.Scheduler.init(allocator, .{});
     defer scheduler.deinit();
 
-    var args = try std.process.argsWithAllocator(allocator);
-    defer args.deinit();
+    const args = try std.process.argsAlloc(gpa.allocator());
+    defer std.process.argsFree(gpa.allocator(), args);
 
-    var bootstrap_addresses = std.ArrayList([]const u8).init(allocator);
-    defer bootstrap_addresses.deinit();
-
-    const options = flags.parseOrExit(&args, "node", CliFlags, .{ .trailing_list = &bootstrap_addresses });
+    const options = flags.parseOrExit(args, "node", CliFlags, .{});
     const listen_address = try stdx.parseIpAddress(options.listen_address);
 
-    const keys = try Ed25519.KeyPair.create(null);
+    const keys = Ed25519.KeyPair.generate();
     log.debug("public key: {}", .{fmt.fmtSliceHexLower(&keys.public_key.bytes)});
     log.debug("secret key: {}", .{fmt.fmtSliceHexLower(keys.secret_key.bytes[0..32])});
 
@@ -67,7 +64,7 @@ pub fn main() !void {
     var bootstrap_tasks = std.ArrayList(coro.Task).init(gpa.allocator());
     defer bootstrap_tasks.deinit();
 
-    for (bootstrap_addresses.items) |bootstrap_address| {
+    for (options.positional.trailing) |bootstrap_address| {
         const address = stdx.parseIpAddress(bootstrap_address) catch |err| {
             log.warn("could not parse boostrap address {s}: {}", .{ bootstrap_address, err });
             continue;
@@ -611,7 +608,7 @@ pub const Client = struct {
             .address = address,
 
             .conn = Connection.init(allocator, .{ .socket = socket }, node_keys),
-            .keys = try X25519.KeyPair.create(null),
+            .keys = X25519.KeyPair.generate(),
         };
     }
 

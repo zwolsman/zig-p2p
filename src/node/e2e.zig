@@ -1,6 +1,5 @@
 const std = @import("std");
 const crypto = std.crypto;
-
 const X25519 = crypto.dh.X25519;
 const KeyPair = X25519.KeyPair;
 const HmacSha256 = crypto.auth.hmac.sha2.HmacSha256;
@@ -242,7 +241,7 @@ const State = struct {
         const recv_key = try DH(self.DHs, self.DHr);
         self.receive_chain = self.root_chain.next(recv_key).chain;
 
-        self.DHs = try KeyPair.create(null);
+        self.DHs = KeyPair.generate();
 
         const send_key = try DH(self.DHs, self.DHr);
         self.send_chain = self.root_chain.next(send_key).chain;
@@ -310,7 +309,7 @@ pub const Session = struct {
     }
 
     fn initRemoteKey(allocator: std.mem.Allocator, id: []const u8, shared_key: [32]u8, remote_key: [32]u8) !Session {
-        const keys = try KeyPair.create(null);
+        const keys = KeyPair.generate();
         var session = Session{ .allocator = allocator, .id = id, .state = State.init(allocator, shared_key, keys) };
 
         session.state.DHr = remote_key;
