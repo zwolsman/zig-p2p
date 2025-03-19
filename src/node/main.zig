@@ -42,12 +42,13 @@ pub fn main() !void {
     const listen_address = try stdx.parseIpAddress(options.listen_address);
 
     const keys = Ed25519.KeyPair.generate();
-    log.debug("public key: {}", .{fmt.fmtSliceHexLower(&keys.public_key.bytes)});
-    log.debug("secret key: {}", .{fmt.fmtSliceHexLower(keys.secret_key.bytes[0..32])});
-
     var node: Node = undefined;
     try node.init(allocator, keys, listen_address);
     try node.bind();
+
+    log.debug("public key: {}", .{fmt.fmtSliceHexLower(&keys.public_key.bytes)});
+    log.debug("secret key: {}", .{fmt.fmtSliceHexLower(keys.secret_key.bytes[0..32])});
+    log.debug("peer id: {}", .{node.id});
 
     _ = try scheduler.spawn(Node.runAcceptLoop, .{ &node, allocator }, .{});
 

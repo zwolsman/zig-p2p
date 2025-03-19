@@ -5,7 +5,6 @@ const mem = std.mem;
 const math = std.math;
 const posix = std.posix;
 const fmt = std.fmt;
-
 const assert = std.debug.assert;
 
 const AddressContext = @import("stdx.zig").AddressContext;
@@ -37,7 +36,12 @@ pub const ID = struct {
                 try writer.writeInt(u32, self.address.in.sa.addr, .little);
                 try writer.writeInt(u16, self.address.in.sa.port, .little);
             },
-            posix.AF.INET6 => return error.UnsupportedAddress, // TODO
+            posix.AF.INET6 => {
+                try writer.writeAll(&self.address.in6.sa.addr);
+                try writer.writeInt(u32, self.address.in6.sa.scope_id, .little);
+                try writer.writeInt(u32, self.address.in6.sa.flowinfo, .little);
+                try writer.writeInt(u16, self.address.in6.sa.port, .little);
+            },
             else => unreachable,
         }
     }
@@ -48,11 +52,25 @@ pub const ID = struct {
 
         switch (try reader.readInt(u8, .little)) {
             posix.AF.INET => {
-                const addr = net.Ip4Address{ .sa = .{ .addr = try reader.readInt(u32, .little), .port = try reader.readInt(u16, .little) } };
+                const addr = net.Ip4Address{ .sa = .{
+                    .addr = try reader.readInt(u32, .little),
+                    .port = try reader.readInt(u16, .little),
+                } };
 
                 id.address = .{ .in = addr };
             },
-            posix.AF.INET6 => return error.UnsupportedAddress, // TODO
+            posix.AF.INET6 => {
+                const addr = net.Ip6Address{
+                    .sa = .{
+                        .addr = try reader.readBytesNoEof(16),
+                        .scope_id = try reader.readInt(u32, .little),
+                        .flowinfo = try reader.readInt(u32, .little),
+                        .port = try reader.readInt(u16, .little),
+                    },
+                };
+
+                id.address = .{ .in6 = addr };
+            },
             else => unreachable,
         }
 
